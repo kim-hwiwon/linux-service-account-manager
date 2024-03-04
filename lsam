@@ -1,0 +1,467 @@
+#!/bin/sh
+
+#==========================================================#
+#                  linux-svc-acc-man (LSAM)                #
+#==========================================================#
+#                                                          #
+#  Make a new linux account and do followings:             #
+#                                                          #
+#  - enable linger:                                        #
+#      enable the user session to use user systemd         #
+#  - export XDG_RUNTIME_DIR:                               #
+#      define required env var to manage user systemd      #
+#  - open firewalld (optional):                            #
+#      open specified tcp/udp ports on firewalld           #
+#                                                          #
+#==========================================================#
+#      Author: Kim Hwiwon < kim.hwiwon@outlook.com >       #
+#==========================================================#
+
+#
+# usage: lsam <MODE> [args...]
+#
+#  <MODE>
+#   - add:     create a new LSAM service account
+#                 $ lsam add <account-name> [port-1] [port-2] ...
+#   - ls:      list all LSAM service accounts
+#                 $ lsam ls
+#   - detail:  print details of an LSAM service account
+#                 $ lsam detail <account-name>
+#   - rm:      remove an LSAM service account
+#                 $ lsam rm <account-name>
+#   - help:    print help message
+#                 $ lsam help
+#
+
+
+
+
+
+########## envs ##########
+# configurable
+UID_LOWER_LIMIT_INC="${UID_LOWER_LIMIT_INC:-50000}"
+UID_UPPER_LIMIT_EXC="${UID_UPPER_LIMIT_EXC:-60000}"
+# fixed
+BIN_BASENAME="$(basename "${0}")"
+ACC_HOME_BASEDIR="/opt"
+LSAM_FIREWALLD_PREFIX="LSAM"     # no dash ('-')
+LSAM_ACC_COMMENT_PREFIX="[LSAM]" # no space (' ')
+
+
+
+########## main routine ##########
+
+
+
+# main function - choose mode
+# args: full argument list of the current command
+main() {
+
+  # script mode
+  _MODE="${1}"
+  if [ "$#" -gt 0 ]; then shift 2>/dev/null; fi
+
+  case "${_MODE}" in
+    "add")
+      mode_add "$@"
+      ;;
+
+    "ls")
+      mode_ls "$@"
+      ;;
+
+    "detail")
+      mode_detail "$@"
+      ;;
+
+    "rm")
+      mode_rm "$@"
+      ;;
+
+    "help")
+      printf "%s\n" "${HELP_STR}"
+      ;;
+
+    *)
+      abort_help "Pass a job to do: [ add / ls / detail / rm / help ]"
+      ;;
+  esac
+}
+
+
+
+# [add] mode
+# args: <acc-name> [svc-port-1] [svc-port-2] ...
+mode_add() {
+  # linux account name
+  _ACC_NAME="${1}"
+  if [ -z "${_ACC_NAME}" ]; \
+    then abort_help "Missing linux user account name"; fi
+  if getent passwd "${_ACC_NAME}" >/dev/null 2>/dev/null; \
+    then abort "Linux user '${_ACC_NAME}' already exists"; fi
+  if getent group "${_ACC_NAME}" >/dev/null 2>/dev/null; \
+    then abort "Linux user group '${_ACC_NAME}' already exists"; fi
+
+  _ACC_HOME="${ACC_HOME_BASEDIR}/${_ACC_NAME}"
+  if [ -e "${_ACC_HOME}" ]; \
+    then abort "Home directory '${_ACC_HOME}' already exists"; fi
+
+  _ACC_ID="$(search_empty_user_id)" || exit 1
+
+  _FIREWALLD_SVC_NAME="${LSAM_FIREWALLD_PREFIX}-${_ACC_NAME}"
+
+  shift 2>/dev/null
+
+
+  test_root_permission
+
+  new_svc_acc "${_ACC_NAME}" "${_ACC_HOME}" "${_ACC_ID}" \
+    || {
+    rm_svc_acc "${_ACC_NAME}" >/dev/null
+    abort "Failed to create a new service account"
+  }
+
+  if [ "$#" -gt 0 ] && command -v firewall-cmd >/dev/null
+  then
+    new_firewall_svc "${_FIREWALLD_SVC_NAME}" "${@}" \
+      || {
+      rm_firewall_svc "${_FIREWALLD_SVC_NAME}" >/dev/null
+      rm_svc_acc "${_ACC_NAME}" >/dev/null
+      abort "Failed to create a new firewalld service"
+    }
+  fi
+}
+
+
+
+# [ls] mode
+# no arg
+mode_ls() {
+  _ACC_PASSWD_ENT="$(getent passwd)"
+  _SED_ARGS="$(printf "%s" "${_ACC_PASSWD_ENT}" | cut -d: -f5 \
+               | cut -d' ' -f1 \
+               | grep -Fxn "${LSAM_ACC_COMMENT_PREFIX}" | cut -d: -f1 \
+               | xargs printf "-e %sp ")"
+  if [ -n "${_SED_ARGS}" ] && [ "${_SED_ARGS}" != "-e p " ]
+  then
+    _ACC_LIST="$(printf "%s" "${_ACC_PASSWD_ENT}" \
+                 | sed -n ${_SED_ARGS} 2>/dev/null | cut -d: -f1)" \
+      || return 1
+  fi
+  printf "\n%s\n\n" \
+         "${_ACC_LIST:-(** No LSAM service account exists **)}"
+}
+
+
+
+# [detail] mode
+# args: <acc-name>
+mode_detail() {
+  _ACC_NAME="${1}"
+  if [ -z "${_ACC_NAME}" ]; \
+    then abort_help "Missing linux user account name"; fi
+  if ! _ACC_PASSWD_ENT="$(getent passwd "${_ACC_NAME}")" \
+       >/dev/null 2>/dev/null; \
+    then abort "No linux user '${_ACC_NAME}' found"; fi
+  if ! printf "%s" "${_ACC_PASSWD_ENT}" | cut -d: -f5 \
+      | cut -d' ' -f1 \
+      | grep -Fx "${LSAM_ACC_COMMENT_PREFIX}" >/dev/null 2>/dev/null
+  then abort "Linux user '${_ACC_NAME}' is not an LSAM account"; fi
+
+
+  test_root_permission
+
+  _ACC_UID="$(printf "%s" "${_ACC_PASSWD_ENT}" | cut -d: -f3)"
+  _ACC_GID="$(printf "%s" "${_ACC_PASSWD_ENT}" | cut -d: -f4)"
+  _ACC_HOME="$(printf "%s" "${_ACC_PASSWD_ENT}" | cut -d: -f6)"
+  unset _ACC_PORTS
+  if command -v firewall-cmd >/dev/null && \
+      sudo firewall-cmd --get-services | tr ' ' '\n' \
+        | grep -Fx "${LSAM_FIREWALLD_PREFIX}-${_ACC_NAME}" \
+               >/dev/null 2>/dev/null
+  then
+    _ACC_PORTS="$(sudo firewall-cmd \
+--info-service="${LSAM_FIREWALLD_PREFIX}-${_ACC_NAME}" 2>/dev/null \
+| grep "^[[:space:]]*ports: " | cut -d: -f2)"
+  else
+    _ACC_PORTS="(No port for this account)"
+  fi
+
+  printf "
+ - Username: %s
+ - UID/GID:  %s:%s
+ - Home:     %s
+ - Ports:    %s
+\n" \
+         "${_ACC_NAME}" "${_ACC_UID}" "${_ACC_GID}" \
+         "${_ACC_HOME}" "${_ACC_PORTS# }"
+}
+
+
+
+# [rm] mode
+# args: <acc-name>
+mode_rm() {
+  # linux account name
+  _ACC_NAME="${1}"
+  if [ -z "${_ACC_NAME}" ]; \
+    then abort_help "Missing linux user account name"; fi
+  if ! _ACC_PASSWD_ENT="$(getent passwd "${_ACC_NAME}")" \
+       >/dev/null 2>/dev/null; \
+    then abort "No linux user '${_ACC_NAME}' found"; fi
+  if ! printf "%s" "${_ACC_PASSWD_ENT}" \
+      | cut -d: -f5 | grep -F "${LSAM_ACC_COMMENT_PREFIX}" \
+                           >/dev/null 2>/dev/null
+  then abort "Linux user '${_ACC_NAME}' is not an LSAM account"; fi
+
+  _FIREWALLD_SVC_NAME="${LSAM_FIREWALLD_PREFIX}-${_ACC_NAME}"
+
+
+  test_root_permission
+
+  if command -v firewall-cmd >/dev/null \
+      && sudo firewall-cmd --get-services \
+        | grep "${_FIREWALLD_SVC_NAME}" >/dev/null 2>/dev/null \
+      && sudo firewall-cmd --info-service="${_FIREWALLD_SVC_NAME}" \
+              >/dev/null 2>/dev/null
+  then
+    rm_firewall_svc "${_FIREWALLD_SVC_NAME}" \
+      || abort "Failed to remove the existing firewalld service"
+  fi
+  rm_svc_acc "${_ACC_NAME}" \
+    || abort "Failed to remove the existing account"
+}
+
+
+
+########## message ##########
+
+
+
+# print help string
+# no arg
+print_help() {
+  printf "usage: %s <MODE> [args...]
+
+  <MODE>
+   - add:     create a new LSAM service account
+                 $ %s add <account-name> [port-1] [port-2] ...
+   - ls:      list all LSAM service accounts
+                 $ %s ls
+   - detail:  print details of an LSAM service account
+                 $ %s detail <account-name>
+   - rm:      remove an LSAM service account
+                 $ %s rm <account-name>
+   - help:    print help message
+                 $ %s help
+  
+" \
+         "${BIN_BASENAME}" "${BIN_BASENAME}" "${BIN_BASENAME}" \
+         "${BIN_BASENAME}" "${BIN_BASENAME}" "${BIN_BASENAME}"
+}
+HELP_STR="$(print_help)"
+
+
+
+# print error message
+# args: <error-msg>
+print_err() {
+  printf "%s: %s\n" \
+         "${BIN_BASENAME}" \
+         "${1:?No error message passed}" \
+         >&2
+}
+
+
+
+# print error message then exit
+# args: <error-msg> [exit-code]
+abort() {
+  print_err "${1}"
+  exit "${2:-1}"
+}
+
+
+
+# print error message with help string then exit
+# args: <error-msg> [exit-code]
+abort_help() {
+  abort "${1}
+
+${HELP_STR}"
+}
+
+
+
+########## helper ##########
+
+
+
+# check if root permission, and ask password if root
+# no arg
+test_root_permission() {
+  if ! sudo true
+  then
+    abort "Root permission check failed!"
+  fi
+}
+
+
+
+# search usable uid
+# no arg
+search_empty_user_id() {
+  if ! [ "${UID_LOWER_LIMIT_INC}" -lt "${UID_UPPER_LIMIT_EXC}" ]
+  then
+    abort "Invalid UID range variables"
+  fi
+  _SEARCH_EMPTY_USER_ID__CUR_ID="${UID_LOWER_LIMIT_INC}"
+
+  while \
+    getent passwd "${_SEARCH_EMPTY_USER_ID__CUR_ID}" \
+           >/dev/null 2>/dev/null \
+      || getent group "${_SEARCH_EMPTY_USER_ID__CUR_ID}" \
+                >/dev/null 2>/dev/null
+  do
+    _SEARCH_EMPTY_USER_ID__CUR_ID="
+$(( _SEARCH_EMPTY_USER_ID__CUR_ID + 1 ))"
+    if ! [ "${_SEARCH_EMPTY_USER_ID__CUR_ID}" \
+             -lt "${UID_UPPER_LIMIT_EXC}" ]
+    then
+      abort "No usable UID and GID found in the given range"\
+            " '[${UID_LOWER_LIMIT_INC}, ${UID_UPPER_LIMIT_EXC})'"
+    fi
+    true
+  done
+
+  printf "%s" "$(( _SEARCH_EMPTY_USER_ID__CUR_ID ))"
+}
+
+
+
+########## funcs ##########
+
+
+
+# create a new linux service account
+# args: <account-name> <account-home> <account-id>
+new_svc_acc() {
+  printf "
+ - Creating a new service account '%s' (UID/GID %s)...
+   (with home directory '%s')\n" \
+         "${1:?name}" "${3:?id}" "${2:?home}"
+
+  # create & init
+  sudo useradd \
+       -mU \
+       -d "${2:?home}" \
+       -u "${3:?id}" \
+       -c "${LSAM_ACC_COMMENT_PREFIX} ${1:?name}" \
+       -s "${SHELL:-/bin/sh}" \
+       "${1:?name}" || return 1
+  sudo loginctl enable-linger "${1:?name}" || return 1
+
+  printf "%s\n%s\n" \
+         "# for systemd command ('systemctl --user')" \
+         "export XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\"" \
+    | sudo -u "${1:?name}" tee "${2:?home}/.profile.lsam" >/dev/null \
+    || return 1
+  printf "\n\n. \"\$HOME/.profile.lsam\"\n" \
+    | sudo -u "${1:?name}" tee -a "${2:?home}/.profile" \
+    | sudo -u "${1:?name}" tee -a "${2:?home}/.bashrc" >/dev/null \
+    || return 1
+  if sudo -u "${1:?name}" [ -e "${2:?home}/.bash_profile" ];
+  then
+  printf "\n\n. \"\$HOME/.profile.lsam\"\n" \
+    | sudo -u "${1:?name}" tee -a "${2:?home}/.bash_profile" \
+           >/dev/null || return 1
+  fi
+  if sudo -u "${1:?name}" [ -e "${2:?home}/.zshrc" ];
+  then
+  printf "\n\n. \"\$HOME/.profile.lsam\"\n" \
+    | sudo -u "${1:?name}" tee -a "${2:?home}/.zshrc" \
+           >/dev/null || return 1
+  fi
+}
+
+
+
+# remove an existing linux service account created by this script
+# args: <account-name>
+rm_svc_acc() {
+  printf "
+ - Removing an existing service account '%s'...
+   (with its home directory)\n" \
+         "${1:?name}"
+
+  sudo loginctl disable-linger "${1:?name}" || return 1
+  if command -v sestatus >/dev/null
+  then sudo userdel -frZ "${1:?name}" || return 1
+  else sudo userdel -fr "${1:?name}" || return 1
+  fi
+}
+
+
+
+# create a new firewall rule for this account
+# args: <service-name> <tcp-port-1> [tcp-port-2] [tcp-port-3] ...
+new_firewall_svc() {
+  # args
+  _NEW_FIREWALL_SVC__NAME="${1:?name}"
+  shift 2>/dev/null
+
+  printf "
+ - Creating a new firewalld rule '%s'...
+   (with ports: %s)\n" \
+         "${_NEW_FIREWALL_SVC__NAME}" "${@:?ports}"
+
+  # add firewall service and apply
+  sudo firewall-cmd --permanent \
+       --new-service="${_NEW_FIREWALL_SVC__NAME}" \
+       >/dev/null || return 1
+  sudo firewall-cmd --permanent \
+       --service="${_NEW_FIREWALL_SVC__NAME}" \
+       --set-short="Ports for ${_NEW_FIREWALL_SVC__NAME}" \
+       >/dev/null || return 1
+  sudo firewall-cmd --permanent \
+       --service="${_NEW_FIREWALL_SVC__NAME}" \
+       --set-description="Ports for ${_NEW_FIREWALL_SVC__NAME}" \
+       >/dev/null || return 1
+  for _PORT in "${@}"
+  do
+    sudo firewall-cmd --permanent \
+         --service="${_NEW_FIREWALL_SVC__NAME}" \
+         --add-port="${_PORT}"/tcp >/dev/null || return 1
+    sudo firewall-cmd --permanent \
+         --service="${_NEW_FIREWALL_SVC__NAME}" \
+         --add-port="${_PORT}"/udp >/dev/null || return 1
+  done
+
+  # enable & reload
+  sudo firewall-cmd --permanent \
+       --add-service="${_NEW_FIREWALL_SVC__NAME}" \
+       >/dev/null || return 1
+  sudo firewall-cmd --reload >/dev/null || return 1
+}
+
+
+
+# remove an existing firewall rule for this account
+# args: <service-name> ...
+rm_firewall_svc() {
+  printf "
+ - Removing an existing firewalld rule '%s'...\n" \
+         "${1:?name}"
+
+  # enable & reload
+  sudo firewall-cmd --permanent \
+       --delete-service="${1:?name}" >/dev/null || return 1
+  sudo firewall-cmd --reload >/dev/null || return 1
+}
+
+
+
+
+
+####################
+main "${@}"
