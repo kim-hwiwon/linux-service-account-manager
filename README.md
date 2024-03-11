@@ -23,7 +23,7 @@ usage: lsam <MODE> [args...]
    - detail:  print details of an LSAM service account
                  $ lsam detail <account-name>
    - rm:      remove an LSAM service account
-                 $ lsam rm <account-name>
+                 $ lsam rm <account-name> [force]
    - help:    print help message
                  $ lsam help
 ```

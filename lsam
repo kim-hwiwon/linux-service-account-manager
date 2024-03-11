@@ -28,7 +28,7 @@
 #   - detail:  print details of an LSAM service account
 #                 $ lsam detail <account-name>
 #   - rm:      remove an LSAM service account
-#                 $ lsam rm <account-name>
+#                 $ lsam rm <account-name> [force]
 #   - help:    print help message
 #                 $ lsam help
 #
@@ -49,6 +49,7 @@ LSAM_ACC_COMMENT_PREFIX="[LSAM]" # no space (' ')
 
 
 
+
 ########## main routine ##########
 
 
@@ -56,6 +57,7 @@ LSAM_ACC_COMMENT_PREFIX="[LSAM]" # no space (' ')
 # main function - choose mode
 # args: full argument list of the current command
 main() {
+  set_colors
 
   # script mode
   _MODE="${1}"
@@ -130,6 +132,10 @@ mode_add() {
       abort "Failed to create a new firewalld service"
     }
   fi
+
+
+  # print info
+  mode_detail "${_ACC_NAME}"
 }
 
 
@@ -145,8 +151,15 @@ mode_ls() {
   if [ -n "${_SED_ARGS}" ] && [ "${_SED_ARGS}" != "-e p " ]
   then
     _ACC_LIST="$(printf "%s" "${_ACC_PASSWD_ENT}" \
-                 | sed -n ${_SED_ARGS} 2>/dev/null | cut -d: -f1)" \
+                 | sed -n ${_SED_ARGS} 2>/dev/null | cut -d: -f1 \
+                 | tr '\n' '\t')" \
       || return 1
+    if [ -n "${_ACC_LIST}" ]
+    then
+      _ACC_LIST="$(printf "%s%s%s" \
+                          "${C_ACCENT_BG}" "${_ACC_LIST}" "${C_RESET}" \
+                   | sed "s/\t/${C_RESET}\t${C_ACCENT_BG}/g")"
+    fi
   fi
   printf "\n%s\n\n" \
          "${_ACC_LIST:-(** No LSAM service account exists **)}"
@@ -183,24 +196,26 @@ mode_detail() {
     _ACC_PORTS="$(sudo firewall-cmd \
 --info-service="${LSAM_FIREWALLD_PREFIX}-${_ACC_NAME}" 2>/dev/null \
 | grep "^[[:space:]]*ports: " | cut -d: -f2)"
-  else
-    _ACC_PORTS="(No port for this account)"
   fi
 
+
   printf "
- - Username: %s
- - UID/GID:  %s:%s
- - Home:     %s
- - Ports:    %s
+Username: %s%s%s
+UID/GID:  %s%s%s:%s%s%s
+Home:     %s%s%s
+Ports:    %s%s%s
 \n" \
-         "${_ACC_NAME}" "${_ACC_UID}" "${_ACC_GID}" \
-         "${_ACC_HOME}" "${_ACC_PORTS# }"
+         "${C_ACCENT_FG}" "${_ACC_NAME}" "${C_RESET}" \
+         "${C_ACCENT_FG}" "${_ACC_UID}" "${C_RESET}" \
+         "${C_ACCENT_FG}" "${_ACC_GID}" "${C_RESET}" \
+         "${C_ACCENT_FG}" "${_ACC_HOME}" "${C_RESET}" \
+         "${C_ACCENT_FG}" "${_ACC_PORTS# }" "${C_RESET}"
 }
 
 
 
 # [rm] mode
-# args: <acc-name>
+# args: <acc-name> [force]
 mode_rm() {
   # linux account name
   _ACC_NAME="${1}"
@@ -219,6 +234,21 @@ mode_rm() {
 
   test_root_permission
 
+  # prompt once before remove if interactive shell
+  if [ -t 1 ] && [ "${2}" != "force" ]
+  then
+    _PROMPT="value_to_start_loop"
+    until [ "${_PROMPT}" = "y" ] || [ "${_PROMPT}" = "Y" ] \
+            || [ "${_PROMPT}" = "n" ] || [ "${_PROMPT}" = "N" ] || [ -z "${_PROMPT}" ]; do
+      read_normal " ${C_WARN_BG}[!!! WARNING !!!]${C_RESET} This process will ${C_WARN_FG}REMOVE ALL DATA${C_RESET} of the user '${C_ACCENT_FG}${_ACC_NAME}${C_RESET}'.
+    Proceed? [${C_WARN_FG}y${C_RESET}/N]" _PROMPT || return 1
+    done
+    if [ "${_PROMPT}" != "y" ] && [ "${_PROMPT}" != "Y" ]; then exit 1; fi
+  fi
+
+  rm_svc_acc "${_ACC_NAME}" \
+    || abort "Failed to remove the existing account"
+
   if command -v firewall-cmd >/dev/null \
       && sudo firewall-cmd --get-services \
         | grep "${_FIREWALLD_SVC_NAME}" >/dev/null 2>/dev/null \
@@ -228,8 +258,6 @@ mode_rm() {
     rm_firewall_svc "${_FIREWALLD_SVC_NAME}" \
       || abort "Failed to remove the existing firewalld service"
   fi
-  rm_svc_acc "${_ACC_NAME}" \
-    || abort "Failed to remove the existing account"
 }
 
 
@@ -241,23 +269,27 @@ mode_rm() {
 # print help string
 # no arg
 print_help() {
-  printf "usage: %s <MODE> [args...]
+  printf "%susage: %s <MODE> [args...]%s
 
   <MODE>
-   - add:     create a new LSAM service account
+   - %sadd%s:     create a new LSAM service account
                  $ %s add <account-name> [port-1] [port-2] ...
-   - ls:      list all LSAM service accounts
+   - %sls%s:      list all LSAM service accounts
                  $ %s ls
-   - detail:  print details of an LSAM service account
+   - %sdetail%s:  print details of an LSAM service account
                  $ %s detail <account-name>
-   - rm:      remove an LSAM service account
-                 $ %s rm <account-name>
-   - help:    print help message
+   - %srm%s:      remove an LSAM service account
+                 $ %s rm <account-name> [force]
+   - %shelp%s:    print help message
                  $ %s help
   
 " \
-         "${BIN_BASENAME}" "${BIN_BASENAME}" "${BIN_BASENAME}" \
-         "${BIN_BASENAME}" "${BIN_BASENAME}" "${BIN_BASENAME}"
+         "${C_ACCENT_FG}" "${BIN_BASENAME}" "${C_RESET}" \
+         "${C_ACCENT_FG}" "${C_RESET}" "${BIN_BASENAME}" \
+         "${C_ACCENT_FG}" "${C_RESET}" "${BIN_BASENAME}" \
+         "${C_ACCENT_FG}" "${C_RESET}" "${BIN_BASENAME}" \
+         "${C_ACCENT_FG}" "${C_RESET}" "${BIN_BASENAME}" \
+         "${C_ACCENT_FG}" "${C_RESET}" "${BIN_BASENAME}"
 }
 HELP_STR="$(print_help)"
 
@@ -266,9 +298,9 @@ HELP_STR="$(print_help)"
 # print error message
 # args: <error-msg>
 print_err() {
-  printf "%s: %s\n" \
+  printf "%s: %s%s%s\n" \
          "${BIN_BASENAME}" \
-         "${1:?No error message passed}" \
+         "${C_WARN_FG}" "${1:?No error message passed}" "${C_RESET}" \
          >&2
 }
 
@@ -289,6 +321,38 @@ abort_help() {
   abort "${1}
 
 ${HELP_STR}"
+}
+
+
+
+# read string from user
+# args: <message> <var-name>
+read_normal() {
+  _="${2:?read_normal: No variable to read specified}"
+
+  trap 'printf "${C_RESET} \n"; return 1' TERM HUP INT
+  printf " + %s:%s " "${1}" "${C_RESET}${C_WARN_FG}"
+  read -r "${2}"
+  _RET_VAL="${?}"
+  trap - TERM HUP INT
+  printf "%s\n" "${C_RESET}"
+
+  return "${_RET_VAL}"
+}
+
+
+
+# set colors
+# no arg
+set_colors() {
+  if [ -t 1 ]
+  then
+    C_ACCENT_FG="$(tput setaf 2 2>/dev/null)"
+    C_ACCENT_BG="$(tput setaf 0 2>/dev/null)$(tput setab 2 2>/dev/null)"
+    C_WARN_FG="$(tput setaf 1 2>/dev/null)"
+    C_WARN_BG="$(tput setaf 0 2>/dev/null)$(tput setab 1 2>/dev/null)"
+    C_RESET="$(tput sgr0 2>/dev/null)$(tput el 2>/dev/null)"
+  fi
 }
 
 
@@ -413,7 +477,7 @@ new_firewall_svc() {
   printf "
  - Creating a new firewalld rule '%s'...
    (with ports: %s)\n" \
-         "${_NEW_FIREWALL_SVC__NAME}" "${@:?ports}"
+         "${_NEW_FIREWALL_SVC__NAME}" "${*:?ports}"
 
   # add firewall service and apply
   sudo firewall-cmd --permanent \
@@ -456,6 +520,7 @@ rm_firewall_svc() {
   # enable & reload
   sudo firewall-cmd --permanent \
        --delete-service="${1:?name}" >/dev/null || return 1
+  sudo rm -f "/etc/firewalld/services/${1:?name}.xml.old" >/dev/null 2>/dev/null
   sudo firewall-cmd --reload >/dev/null || return 1
 }
 
