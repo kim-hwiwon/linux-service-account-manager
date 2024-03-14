@@ -2,6 +2,7 @@
 
 #==========================================================#
 #                  linux-svc-acc-man (LSAM)                #
+#                                                    v1.2  #
 #==========================================================#
 #                                                          #
 #  Make a new linux account and do followings:             #
@@ -320,7 +321,7 @@ abort() {
 abort_help() {
   abort "${1}
 
-${HELP_STR}"
+${C_RESET}${HELP_STR}"
 }
 
 
@@ -459,6 +460,7 @@ rm_svc_acc() {
          "${1:?name}"
 
   sudo loginctl disable-linger "${1:?name}" || return 1
+  sudo killall -w -u "${1:?name}"
   if command -v sestatus >/dev/null
   then sudo userdel -frZ "${1:?name}" || return 1
   else sudo userdel -fr "${1:?name}" || return 1
