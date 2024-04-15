@@ -1,0 +1,23 @@
+#==========================================================#
+#           SSH login welcome message for LiSAM            #
+#                                                          #
+#   prints welcome message about LiSAM                     #
+#   place this file at ~/.ssh/rc,                          #
+#   after placing lisam script at one of ${PATH} dirs      #
+#                                                          #
+#==========================================================#
+
+command -v lisam >/dev/null && printf "\n
+===============[ LiSAM service account list ]===============
+%s
+============================================================
+
+
+=======================[ LiSAM usage ]======================
+* Create or manage service accounts with the command 'lisam'
+- %s
+============================================================
+
+\n" "$(LISAM_COLORED=1 lisam ls)" "$(LISAM_COLORED=1 lisam usage)" >&2
+
+#==========================================================#

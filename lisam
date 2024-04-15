@@ -1,0 +1,1546 @@
+#!/bin/sh
+
+#==========================================================#
+#          Linux Service Account Manager (LiSAM)           #
+#                                                    v2.0  #
+#==========================================================#
+#                                                          #
+# Users created by this script will:                       #
+# - Have user systemd service functions                    #
+#   (with `loginctl enable-linger`                         #
+#    and `export XDG_RUNTIME_DIR`)                         #
+# - Have limited system resources, configured by           #
+#   systemd resource control (cgroups)                     #
+# - (Optional) Get open ports for the account              #
+#   (with `firewalld`)                                     #
+#   - Ignored if `firewalld` is not installed              #
+#                                                          #
+#==========================================================#
+#      Author: Kim Hwiwon < kim.hwiwon@outlook.com >       #
+#==========================================================#
+
+#
+# usage: lisam <MODE> [ARGS]... [<OPT> <OPT_VAL>]...
+#
+#
+# <MODE>
+#
+#    - add: create a new LiSAM service account
+#        $ lisam add <account-name> [OPTIONS]...
+#          [OPTIONS]
+#            -u, --uid < # >                             : Linux account UID
+#            -c, --cpu-weight < 1-10000 | idle >         : Systemd CPUWeight
+#            -C, --cpu-quota < #% >                      : Systemd CPUQuota
+#            -m, --memory-max < #[K|M|G|T] | 0%-100% >   : Systemd MemoryMax
+#            -M, --memory-high < #[K|M|G|T] | 0%-100% >  : Systemd MemoryHigh
+#            -s, --swap-max < #[K|M|G|T] | 0%-100% >     : Systemd MemorySwapMax
+#            -z, --zswap-max < #[K|M|G|T] | 0%-100% >    : Systemd MemoryZSwapMax
+#            -t, --tasks-max < # >                       : Systemd TasksMax
+#            -i, --io-weight < 1-10000 >                 : Systemd IOWeight
+#            -d, --dev-allowed < ${DEV_PATH} >           : Systemd DeviceAllow
+#                * Pass multiple options to set more than one device path
+#            -p, --sock-allowed < 1-65535 >              : Systemd SockBindAllow
+#                * Pass multiple options to set more than one
+#
+#    - mod: modify a LiSAM service account
+#        $ lisam mod <account-name> [OPTIONS]...
+#          [OPTIONS]
+#            -c, --cpu-weight < 1-10000 | idle >         : Systemd CPUWeight
+#            -C, --cpu-quota < #% >                      : Systemd CPUQuota
+#            -m, --memory-max < #[K|M|G|T] | 0%-100% >   : Systemd MemoryMax
+#            -M, --memory-high < #[K|M|G|T] | 0%-100% >  : Systemd MemoryHigh
+#            -s, --swap-max < #[K|M|G|T] | 0%-100% >     : Systemd MemorySwapMax
+#            -z, --zswap-max < #[K|M|G|T] | 0%-100% >    : Systemd MemoryZSwapMax
+#            -t, --tasks-max < # >                       : Systemd TasksMax
+#            -i, --io-weight < 1-10000 >                 : Systemd IOWeight
+#            -d, --dev-allowed < ${DEV_PATH} >           : Systemd DeviceAllow
+#                * Pass multiple options to set more than one device path
+#            -p, --sock-allowed < 1-65535 >              : Systemd SockBindAllow
+#                * Pass multiple options to set more than one
+#
+#    - ls: list all LiSAM service accounts
+#        $ lisam ls
+#
+#    - detail: print details of an LiSAM service account
+#        $ lisam detail <account-name>
+#
+#    - rm: remove an LiSAM service account
+#        $ lisam rm <account-name> [OPTIONS]...
+#          [OPTIONS]
+#            -f, --force                 : Force remove without prompt
+#
+#    - usage: print usage message
+#        $ lisam usage
+#
+#    - help: print help message
+#        $ lisam help
+#
+#
+# [OPT_VAL] Special Patterns
+#
+#    - <X>     : Required wrapper
+#    - [X]     : Optional wrapper (X can be omitted)
+#    - #       : Arbitrary digits (positive integer)
+#    - ${X}    : Arbitrary string (X is a description of the string)
+#    - A|B     : A or B
+#    - A-B     : Value range from A to B (inclusive)
+#
+
+
+
+
+
+#==========================================================#
+#                       environments                       #
+#==========================================================#
+
+########## envs ##########
+
+# configurable
+UID_LOWER_LIMIT_INC="${UID_LOWER_LIMIT_INC:-30000}"
+UID_UPPER_LIMIT_EXC="${UID_UPPER_LIMIT_EXC:-40000}"
+LISAM_COLORED="${LISAM_COLORED:-}"
+
+TERM_WIDTH="${TERM_WIDTH:-60}"
+LIST_SPACES="${LIST_SPACES:-3}"
+
+# fixed
+BIN_BASENAME="$(basename "${0}")"
+ACC_HOME_BASEDIR="/opt/lisam"
+LISAM_FILE_PREFIX="LiSAM"     # no dash ('-')
+LISAM_ACC_COMMENT_PREFIX="[LiSAM]" # no space (' ')
+USER_SLICE_PREFIX="user-"
+USER_SLICE_POSTFIX=".slice"
+SYSTEMD_RC_DIR="/etc/systemd/system.control"
+SYSTEMD_USER_SLICE_PREFIX="${SYSTEMD_RC_DIR}/user-"
+SYSTEMD_USER_SLICE_POSTFIX=".slice.d"
+SYSTEMD_USER_SERVICE_PREFIX="${SYSTEMD_RC_DIR}/user@"
+SYSTEMD_USER_SERVICE_POSTFIX=".service.d"
+
+# etc
+CGROUP_USER_SLICE_ROOT="/sys/fs/cgroup/user.slice"
+
+
+
+
+
+#==========================================================#
+#              systemd resource control vars               #
+#==========================================================#
+
+# cache content for get_rc() func
+unset USER_SLICE_RC_CONTENT
+
+
+########## systemd RC accountings ##########
+# shellcheck disable=SC2034
+USER_CPU__LABEL="CPUAccounting"
+# shellcheck disable=SC2034
+USER_MEM__LABEL="MemoryAccounting"
+# shellcheck disable=SC2034
+USER_TASKS__LABEL="TasksAccounting"
+# shellcheck disable=SC2034
+USER_IO__LABEL="IOAccounting"
+# shellcheck disable=SC2034
+USER_NETWORK__LABEL="IPAccounting"
+
+
+########## systemd resource control consts keys ##########
+# shellcheck disable=SC2034
+USER_SOCK_DENY__LABEL="SocketBindDeny"
+# shellcheck disable=SC2034
+USER_DEV_POLICY__LABEL="DevicePolicy"
+# shellcheck disable=SC2034
+USER_OOM_SWAP__LABEL="ManagedOOMSwap"
+# shellcheck disable=SC2034
+USER_OOM_MEM_PRESSURE__LABEL="ManagedOOMMemoryPressure"
+
+# default values
+# shellcheck disable=SC2034
+USER_SOCK_DENY__DEFAULT="any"
+# shellcheck disable=SC2034
+USER_DEV_POLICY__DEFAULT="closed"
+# shellcheck disable=SC2034
+USER_OOM_SWAP__DEFAULT="kill"
+# shellcheck disable=SC2034
+USER_OOM_MEM_PRESSURE__DEFAULT="kill"
+
+
+########## systemd resource control configurable keys & vars ##########
+# shellcheck disable=SC2034
+USER_CPU_WEIGHT__LABEL="CPUWeight"
+# shellcheck disable=SC2034
+USER_CPU_WEIGHT__CNT=1
+unset USER_CPU_WEIGHT
+
+# shellcheck disable=SC2034
+USER_CPU_QUOTA__LABEL="CPUQuota"
+# shellcheck disable=SC2034
+USER_CPU_QUOTA__CNT=1
+unset USER_CPU_QUOTA
+
+# shellcheck disable=SC2034
+USER_MEM_MAX__LABEL="MemoryMax"
+# shellcheck disable=SC2034
+USER_MEM_MAX__CNT=1
+unset USER_MEM_MAX
+
+# shellcheck disable=SC2034
+USER_MEM_HIGH__LABEL="MemoryHigh"
+# shellcheck disable=SC2034
+USER_MEM_HIGH__CNT=1
+unset USER_MEM_HIGH
+
+# shellcheck disable=SC2034
+USER_SWAP_MAX__LABEL="MemorySwapMax"
+# shellcheck disable=SC2034
+USER_SWAP_MAX__CNT=1
+unset USER_SWAP_MAX
+
+# shellcheck disable=SC2034
+USER_ZSWAP_MAX__LABEL="MemoryZSwapMax"
+# shellcheck disable=SC2034
+USER_ZSWAP_MAX__CNT=1
+# shellcheck disable=SC2034
+USER_ZSWAP_MAX__OPTIONAL=1
+unset USER_ZSWAP_MAX
+
+# shellcheck disable=SC2034
+USER_TASKS_MAX__LABEL="TasksMax"
+# shellcheck disable=SC2034
+USER_TASKS_MAX__CNT=1
+unset USER_TASKS_MAX
+
+# shellcheck disable=SC2034
+USER_IO_WEIGHT__LABEL="IOWeight"
+# shellcheck disable=SC2034
+USER_IO_WEIGHT__CNT=1
+unset USER_IO_WEIGHT
+
+# shellcheck disable=SC2034
+USER_DEV_ALLOW__LABEL="DeviceAllow"
+# shellcheck disable=SC2034
+USER_DEV_ALLOW__CNT=
+unset USER_DEV_ALLOW
+
+# shellcheck disable=SC2034
+USER_SOCK_ALLOW__LABEL="SocketBindAllow"
+# shellcheck disable=SC2034
+USER_SOCK_ALLOW__CNT=
+unset USER_SOCK_ALLOW
+
+
+# shellcheck disable=SC2034
+USER_CPU_WEIGHT__CURFILE="cpu.weight"
+# shellcheck disable=SC2034
+USER_CPU_QUOTA__CURFILE="cpu.max"
+# shellcheck disable=SC2034
+USER_MEM_MAX__CURFILE="memory.max"
+# shellcheck disable=SC2034
+USER_MEM_HIGH__CURFILE="memory.high"
+# shellcheck disable=SC2034
+USER_SWAP_MAX__CURFILE="memory.swap.max"
+# shellcheck disable=SC2034
+USER_ZSWAP_MAX__CURFILE="memory.zswap.max"
+# shellcheck disable=SC2034
+USER_TASKS_MAX__CURFILE="pids.max"
+# shellcheck disable=SC2034
+USER_IO_WEIGHT__CURFILE="io.weight"
+
+# default values
+# shellcheck disable=SC2034
+USER_CPU_WEIGHT__DEFAULT="20"
+# shellcheck disable=SC2034
+USER_CPU_QUOTA__DEFAULT=""
+# shellcheck disable=SC2034
+USER_MEM_MAX__DEFAULT="50%"
+# shellcheck disable=SC2034
+USER_MEM_HIGH__DEFAULT=""
+# shellcheck disable=SC2034
+USER_SWAP_MAX__DEFAULT="0"
+# shellcheck disable=SC2034
+USER_ZSWAP_MAX__DEFAULT="0"
+# shellcheck disable=SC2034
+USER_TASKS_MAX__DEFAULT="100"
+# shellcheck disable=SC2034
+USER_IO_WEIGHT__DEFAULT="20"
+# shellcheck disable=SC2034
+USER_DEV_ALLOW__DEFAULT=""
+# shellcheck disable=SC2034
+USER_SOCK_ALLOW__DEFAULT=""
+
+# default command
+# shellcheck disable=SC2016,SC2034
+USER_MEM_HIGH__DEFAULT_CMD='
+__USER_MEM_HIGH__DEFAULT_CMD__mem_max="$(get_var_default "USER_MEM_MAX")" || exit 1;
+__USER_MEM_HIGH__DEFAULT_CMD__mem_max_n="${__USER_MEM_HIGH__DEFAULT_CMD__mem_max%%[^[:digit:]]*}" || exit 1;
+printf "%s%s" "$((__USER_MEM_HIGH__DEFAULT_CMD__mem_max_n * 9 / 10))" "${__USER_MEM_HIGH__DEFAULT_CMD__mem_max#${__USER_MEM_HIGH__DEFAULT_CMD__mem_max_n}}" || exit 1;'
+
+
+########## var list for dynamic var read ##########
+# all rc configurable key list
+SYSTEMD_RC_LIST="USER_CPU_WEIGHT USER_CPU_QUOTA \
+                 USER_MEM_MAX USER_MEM_HIGH USER_SWAP_MAX USER_ZSWAP_MAX  \
+                 USER_TASKS_MAX USER_IO_WEIGHT USER_DEV_ALLOW USER_SOCK_ALLOW"
+# all rc accounting list
+SYSTEMD_RC_ACCOUNTING_LIST="USER_CPU USER_MEM USER_TASKS \
+                            USER_IO USER_NETWORK"
+# all rc const key list
+SYSTEMD_RC_CONST_LIST="USER_SOCK_DENY USER_DEV_POLICY \
+                       USER_OOM_SWAP USER_OOM_MEM_PRESSURE"
+
+
+
+
+
+
+#==========================================================#
+#                       main routine                       #
+#==========================================================#
+
+
+
+# main function - choose mode
+# local prefix: M
+# args: full argument list of the current command
+main() {
+  set_colors
+
+  # script mode
+  _M__MODE="${1}"
+  if [ "$#" -gt 0 ]; then shift 2>/dev/null; fi
+
+  case "${_M__MODE}" in
+    "add") mode_add "${@}" ;;
+    "mod") mode_mod "${@}" ;;
+    "ls") mode_ls "${@}" ;;
+    "detail") mode_detail "${@}" ;;
+    "rm") mode_rm "${@}" ;;
+    "usage") printf "%s\n" "$(print_usage)" ;;
+    "help") printf "%s\n" "$(print_help)" ;;
+    "") abort_usage "Missing command verb" ;;
+    *) abort_usage "Invalid command verb: '${_M__MODE}'" ;;
+  esac
+}
+
+
+
+# [add] mode
+# local prefix: MA
+# args: <acc-name> [args]...
+mode_add() {
+  # parse all opts and args
+  parse_opts "${BIN_BASENAME}" "u:c:C:m:M:s:z:t:i:d:p:" "uid:,cpu-weight:,cpu-quota:,memory-max:,memory-high:,swap-max:,zswap-max:,tasks-max:,io-weight:,dev-allowed:,sock-allowed:" "${@}" \
+    && eval set -- "${PARSE_OPTS__args}" || return 1
+
+  # parsed opts
+  # shellcheck disable=SC2034
+  USER_UID="${PARSE_OPTS__opt__uid:-${PARSE_OPTS__opt_u}}"
+  # shellcheck disable=SC2034
+  USER_CPU_WEIGHT="${PARSE_OPTS__opt__cpu_weight:-${PARSE_OPTS__opt_c}}"
+  # shellcheck disable=SC2034
+  USER_CPU_QUOTA="${PARSE_OPTS__opt__cpu_quota:-${PARSE_OPTS__opt_C}}"
+  # shellcheck disable=SC2034
+  USER_MEM_MAX="${PARSE_OPTS__opt__memory_max:-${PARSE_OPTS__opt_m}}"
+  # shellcheck disable=SC2034
+  USER_MEM_HIGH="${PARSE_OPTS__opt__memory_high:-${PARSE_OPTS__opt_M}}"
+  # shellcheck disable=SC2034
+  USER_SWAP_MAX="${PARSE_OPTS__opt__swap_max:-${PARSE_OPTS__opt_s}}"
+  # shellcheck disable=SC2034
+  USER_ZSWAP_MAX="${PARSE_OPTS__opt__zswap_max:-${PARSE_OPTS__opt_z}}"
+  # shellcheck disable=SC2034
+  USER_TASKS_MAX="${PARSE_OPTS__opt__tasks_max:-${PARSE_OPTS__opt_t}}"
+  # shellcheck disable=SC2034
+  USER_IO_WEIGHT="${PARSE_OPTS__opt__io_weight:-${PARSE_OPTS__opt_i}}"
+  # shellcheck disable=SC2034
+  USER_DEV_ALLOW="${PARSE_OPTS__opt__dev_allowed:+${PARSE_OPTS__opt__dev_allowed}
+}${PARSE_OPTS__opt_d:-}"
+  # shellcheck disable=SC2034
+  USER_SOCK_ALLOW="${PARSE_OPTS__opt__sock_allowed:+${PARSE_OPTS__opt__sock_allowed}
+}${PARSE_OPTS__opt_p:-}"
+
+
+  # linux account name
+  _MA__acc_name="${1}"
+  if [ -z "${_MA__acc_name}" ]; \
+    then abort_usage "Missing linux user account name"; fi
+  if getent passwd "${_MA__acc_name}" >/dev/null 2>/dev/null; \
+    then abort "Linux user '${_MA__acc_name}' already exists"; fi
+  if getent group "${_MA__acc_name}" >/dev/null 2>/dev/null; \
+    then abort "Linux user group '${_MA__acc_name}' already exists"; fi
+
+  _MA__acc_home="${ACC_HOME_BASEDIR}/${_MA__acc_name}"
+  if [ -e "${_MA__acc_home}" ]; \
+    then abort "Home directory '${_MA__acc_home}' already exists"; fi
+
+  _MA__acc_id="$(search_empty_user_id "${USER_UID}" "$((USER_UID + 1))")" \
+    || exit 1
+
+  _MA__firewalld_svc_name="${LISAM_FILE_PREFIX}-${_MA__acc_name}"
+
+  shift 2>/dev/null
+
+
+  test_root_permission
+
+  new_svc_acc "${_MA__acc_name}" "${_MA__acc_home}" "${_MA__acc_id}" \
+    || {
+    rm_svc_acc "${_MA__acc_name}" >/dev/null
+    rm_acc_rc "${_MA__acc_id}" >/dev/null
+    abort "Failed to create a new service account"
+  }
+
+  # add all data
+  refresh_acc_rc "${_MA__acc_id}" || {
+    rm_svc_acc "${_MA__acc_name}" >/dev/null
+    rm_acc_rc "${_MA__acc_id}" >/dev/null
+    abort "Failed to create new resource control configs"
+  }
+
+  sudo loginctl enable-linger "${_MA__acc_name}" \
+    || {
+    rm_svc_acc "${_MA__acc_name}" >/dev/null
+    rm_acc_rc "${_MA__acc_id}" >/dev/null
+    abort "Failed to enable linger"
+  }
+
+  if command -v firewall-cmd >/dev/null
+  then
+    new_firewall_svc "${_MA__firewalld_svc_name}" \
+      || {
+      rm_firewall_svc "${_MA__firewalld_svc_name}" >/dev/null
+      rm_svc_acc "${_MA__acc_name}" >/dev/null
+      rm_acc_rc "${_MA__acc_id}" >/dev/null
+      abort "Failed to create a new firewalld service"
+    }
+  fi
+
+
+  # print info
+  mode_detail "${_MA__acc_name}"
+}
+
+
+
+# [mod] mode
+# local prefix: MM
+# args: <acc-name> [args]...
+mode_mod() {
+  # parse all opts and args
+  parse_opts "${BIN_BASENAME}" "c:C:m:M:s:z:t:i:d:p:" "cpu-weight:,cpu-quota:,memory-max:,memory-high:,swap-max:,zswap-max:,tasks-max:,io-weight:,dev-allowed:,sock-allowed:" "${@}" \
+    && eval set -- "${PARSE_OPTS__args}" || return 1
+
+  # parsed opts
+  # shellcheck disable=SC2034
+  ! if_var_set PARSE_OPTS__opt__cpu_weight && ! if_var_set PARSE_OPTS__opt_c \
+    || USER_CPU_WEIGHT="${PARSE_OPTS__opt__cpu_weight:-${PARSE_OPTS__opt_c}}"
+  # shellcheck disable=SC2034
+  ! if_var_set PARSE_OPTS__opt__cpu_quota && ! if_var_set PARSE_OPTS__opt_C \
+    || USER_CPU_QUOTA="${PARSE_OPTS__opt__cpu_quota:-${PARSE_OPTS__opt_C}}"
+  # shellcheck disable=SC2034
+  ! if_var_set PARSE_OPTS__opt__memory_max && ! if_var_set PARSE_OPTS__opt_m \
+    || USER_MEM_MAX="${PARSE_OPTS__opt__memory_max:-${PARSE_OPTS__opt_m}}"
+  # shellcheck disable=SC2034
+  ! if_var_set PARSE_OPTS__opt__memory_high && ! if_var_set PARSE_OPTS__opt_M \
+    || USER_MEM_HIGH="${PARSE_OPTS__opt__memory_high:-${PARSE_OPTS__opt_M}}"
+  # shellcheck disable=SC2034
+  ! if_var_set PARSE_OPTS__opt__swap_max && ! if_var_set PARSE_OPTS__opt_s \
+    || USER_SWAP_MAX="${PARSE_OPTS__opt__swap_max:-${PARSE_OPTS__opt_s}}"
+  # shellcheck disable=SC2034
+  ! if_var_set PARSE_OPTS__opt__zswap_max && ! if_var_set PARSE_OPTS__opt_z \
+    || USER_ZSWAP_MAX="${PARSE_OPTS__opt__zswap_max:-${PARSE_OPTS__opt_z}}"
+  # shellcheck disable=SC2034
+  ! if_var_set PARSE_OPTS__opt__tasks_max && ! if_var_set PARSE_OPTS__opt_t \
+    || USER_TASKS_MAX="${PARSE_OPTS__opt__tasks_max:-${PARSE_OPTS__opt_t}}"
+  # shellcheck disable=SC2034
+  ! if_var_set PARSE_OPTS__opt__io_weight && ! if_var_set PARSE_OPTS__opt_i \
+    || USER_IO_WEIGHT="${PARSE_OPTS__opt__io_weight:-${PARSE_OPTS__opt_i}}"
+  # shellcheck disable=SC2034
+  ! if_var_set PARSE_OPTS__opt__dev_allowed && ! if_var_set PARSE_OPTS__opt_d \
+    || USER_DEV_ALLOW="${PARSE_OPTS__opt__dev_allowed:+${PARSE_OPTS__opt__dev_allowed}
+}${PARSE_OPTS__opt_d:-}"
+  # shellcheck disable=SC2034
+  ! if_var_set PARSE_OPTS__opt__sock_allowed && ! if_var_set PARSE_OPTS__opt_p \
+    || USER_SOCK_ALLOW="${PARSE_OPTS__opt__sock_allowed:+${PARSE_OPTS__opt__sock_allowed}
+}${PARSE_OPTS__opt_p:-}"
+
+
+  # linux account name
+  _MM__acc_name="${1}"
+  if [ -z "${_MM__acc_name}" ]; \
+    then abort_usage "Missing linux user account name"; fi
+  if ! _MM__acc_passwd_ent="$(getent passwd "${_MM__acc_name}")" \
+       >/dev/null 2>/dev/null; \
+    then abort "No linux user '${_MM__acc_name}' found"; fi
+  if ! printf "%s" "${_MM__acc_passwd_ent}" \
+      | cut -d: -f5 \
+      | grep -F "${LISAM_ACC_COMMENT_PREFIX}" \
+             >/dev/null 2>/dev/null
+  then abort "Linux user '${_MM__acc_name}' is not an LiSAM account"; fi
+  _MM__acc_uid="$(printf "%s" "${_MM__acc_passwd_ent}" | cut -d: -f3)"
+
+  _MM__firewalld_svc_name="${LISAM_FILE_PREFIX}-${_MM__acc_name}"
+
+  shift 2>/dev/null
+
+
+  test_root_permission
+
+  # add all data
+  refresh_acc_rc "${_MM__acc_uid}" "reset" || {
+    abort "Failed to refresh resource control configs"
+  }
+
+  if command -v firewall-cmd >/dev/null && if_var_set USER_SOCK_ALLOW
+  then
+    rm_firewall_svc "${_MM__firewalld_svc_name}" >/dev/null
+    new_firewall_svc "${_MM__firewalld_svc_name}" \
+      || {
+      rm_firewall_svc "${_MM__firewalld_svc_name}" >/dev/null
+      abort "Failed to create a new firewalld service"
+    }
+  fi
+
+
+  # print info
+  mode_detail "${_MM__acc_name}"
+}
+
+
+
+# [ls] mode
+# local prefix: ML
+# no arg
+mode_ls() {
+  # parse all opts and args
+  parse_opts "${BIN_BASENAME}" "" "" "${@}" && eval set -- "${PARSE_OPTS__args}" || return 1
+
+
+  _ML__acc_passwd_ent="$(getent passwd)"
+  _ML__sed_args="$(printf "%s" "${_ML__acc_passwd_ent}" | cut -d: -f5 \
+                   | cut -d' ' -f1 \
+                   | grep -Fxn "${LISAM_ACC_COMMENT_PREFIX}" | cut -d: -f1 \
+                   | xargs -r printf "-e %sp ")"
+  unset _ML__acc_list
+  # shellcheck disable=SC2086
+  [ -n "${_ML__sed_args}" ] \
+    && _ML__acc_list="$(printf "%s" "${_ML__acc_passwd_ent}" \
+                        | sed -n ${_ML__sed_args} 2>/dev/null \
+                        | cut -d: -f1)"
+  if terminal_output
+  then
+    _ML__acc_name_width="$(( LIST_SPACES + $(printf "%s\n" "${_ML__acc_list}" | wc -L) ))"
+    _ML__acc_per_line="$(( TERM_WIDTH / _ML__acc_name_width ))"
+    [ "${_ML__acc_per_line}" -eq 0 ] && _ML__acc_per_line=1
+
+    _ML__acc_list="$(printf "%s" "${_ML__acc_list}" \
+                     | xargs -I{} -r \
+                             printf "%-*s" "${_ML__acc_name_width}" "{}" \
+                     | sed -e 's|\([^ ][^ ]*\)\(  *\)|'"${C_G_BG}"'\1'"${C_RESET}"'\2|g' \
+                           -e 's|\(\([^ ][^ ]*  *\)\{1,'"${_ML__acc_per_line}"'\}\)|\1\n|g')"
+
+    # print non-existence message if stdout is terminal
+    _ML__acc_list="${_ML__acc_list:-${C_ERR_FG} * No LiSAM service account exists * ${C_RESET}}"
+  fi
+
+  printf "%s" "${_ML__acc_list:+${_ML__acc_list}
+}"
+}
+
+
+
+# [detail] mode
+# local prefix: MD
+# args: <acc-name>
+mode_detail() {
+  # parse all opts and args
+  parse_opts "${BIN_BASENAME}" "" "" "${@}" && eval set -- "${PARSE_OPTS__args}" || return 1
+
+
+  _MD__acc_name="${1}"
+  if [ -z "${_MD__acc_name}" ]; \
+    then abort_usage "Missing linux user account name"; fi
+  if ! _MD__acc_passwd_ent="$(getent passwd "${_MD__acc_name}")" \
+       >/dev/null 2>/dev/null; \
+    then abort "No linux user '${_MD__acc_name}' found"; fi
+  if ! printf "%s" "${_MD__acc_passwd_ent}" | cut -d: -f5 \
+      | cut -d' ' -f1 \
+      | grep -Fx "${LISAM_ACC_COMMENT_PREFIX}" >/dev/null 2>/dev/null
+  then abort "Linux user '${_MD__acc_name}' is not an LiSAM account"; fi
+
+
+  _MD__acc_uid="$(printf "%s" "${_MD__acc_passwd_ent}" | cut -d: -f3)"
+  _MD__acc_gid="$(printf "%s" "${_MD__acc_passwd_ent}" | cut -d: -f4)"
+  _MD__acc_home="$(printf "%s" "${_MD__acc_passwd_ent}" | cut -d: -f6)"
+
+  # get all configurable rc configs
+  unset _MD__rc_detail_str
+  cache_rc "${_MD__acc_uid}"
+  for _MD__k_varname in ${SYSTEMD_RC_LIST}
+  do
+    _MD__cnt="$(get_var_cnt "${_MD__k_varname}")"
+    _MD__k="$(get_var_label "${_MD__k_varname}")"
+    _MD__v="$(get_rc "${_MD__acc_uid}" "${_MD__k}" "${_MD__cnt}")"
+    # get current cgroup v2 value
+    #   - if curfile var is set but value is not read, unset var
+    #   - if curfile var is not set, leave var empty (but set)
+    _MD__v_current="$(get_var_actual "${_MD__acc_uid}" \
+                                     "${_MD__k_varname}")" \
+      && [ -z "${_MD__v_current}" ] && unset _MD__v_current
+
+
+    if [ "${_MD__cnt}" -le 1 ]
+    then
+      _MD__rc_detail_str="$(printf "%s\n      %-20s %s%-15s%s %s%-15s%s" \
+                                   "${_MD__rc_detail_str}" \
+                                   "${_MD__k}" \
+                                   "${_MD__v:+${C_G_FG}}" \
+                                   "${_MD__v:-(not-set)}" \
+                                   "${C_RESET}" \
+                                   "${_MD__v_current:+${C_G_FG}}" \
+                                   "${_MD__v_current-(N/A)}" \
+                                   "${C_RESET}" \
+                           )"
+    else
+      terminal_output && _MD__v_delim=" " || _MD__v_delim="$(printf '\t')"
+      _MD__v_fmt="$(IFS='
+'
+                    for _MD__v_tmp in ${_MD__v}
+                    do
+                      printf "%s%c" "${C_G_BG}${_MD__v_tmp}${C_RESET}" "${_MD__v_delim}"
+                    done
+                   )"
+      _MD__rc_detail_str="$(printf "%s\n      %-20s %s%s" \
+                                   "${_MD__rc_detail_str}" \
+                                   "${_MD__k}" \
+                                   "${_MD__v_fmt:-(not-set)}" \
+                                   "${C_RESET}" \
+                           )"
+    fi
+  done
+
+  printf "
+Username     %s%s%s
+UID:GID      %s%s%s:%s%s%s
+Home         %s%s%s
+
+Resource-Limits ('%s')
+
+      %-20s %-15s %s %s
+\n" \
+         "${C_G_FG}" "${_MD__acc_name}" "${C_RESET}" \
+         "${C_G_FG}" "${_MD__acc_uid}" "${C_RESET}" \
+         "${C_G_FG}" "${_MD__acc_gid}" "${C_RESET}" \
+         "${C_G_FG}" "${_MD__acc_home}" "${C_RESET}" \
+         "${USER_SLICE_PREFIX}${_MD__acc_uid}${USER_SLICE_POSTFIX}" \
+         "[ Key ]" "[ Value ]" "[ Cgroup Status ]" \
+         "${_MD__rc_detail_str}"
+}
+
+
+
+# [rm] mode
+# local prefix: MR
+# args: <acc-name> [-f]
+mode_rm() {
+  # parse all opts and args
+  parse_opts "${BIN_BASENAME}" "f" "force" "${@}" && eval set -- "${PARSE_OPTS__args}" || return 1
+
+
+  # linux account name
+  _MR__acc_name="${1}"
+  if [ -z "${_MR__acc_name}" ]; \
+    then abort_usage "Missing linux user account name"; fi
+  if ! _MR__acc_passwd_ent="$(getent passwd "${_MR__acc_name}")" \
+       >/dev/null 2>/dev/null; \
+    then abort "No linux user '${_MR__acc_name}' found"; fi
+  if ! printf "%s" "${_MR__acc_passwd_ent}" \
+      | cut -d: -f5 \
+      | grep -F "${LISAM_ACC_COMMENT_PREFIX}" \
+             >/dev/null 2>/dev/null
+  then abort "Linux user '${_MR__acc_name}' is not an LiSAM account"; fi
+  _MR__acc_uid="$(printf "%s" "${_MR__acc_passwd_ent}" | cut -d: -f3)"
+
+  _MR__firewalld_svc_name="${LISAM_FILE_PREFIX}-${_MR__acc_name}"
+
+
+  test_root_permission
+
+  # prompt once before remove if interactive shell
+  if [ -t 0 ] && { [ -z "${PARSE_OPTS__opt_f}" ] && [ -z "${PARSE_OPTS__opt__force}" ] ; }
+  then
+    _MR__prompt="value_to_start_loop"
+    until [ "${_MR__prompt}" = "y" ] || [ "${_MR__prompt}" = "Y" ] \
+            || [ "${_MR__prompt}" = "n" ] || [ "${_MR__prompt}" = "N" ] \
+            || [ -z "${_MR__prompt}" ]; do
+      read_normal " ${C_ERR_BG}[!!! WARNING !!!]${C_RESET} This process will ${C_ERR_FG}REMOVE ALL DATA${C_RESET} of the user '${C_G_FG}${_MR__acc_name}${C_RESET}'.
+    Proceed? [${C_ERR_FG}y${C_RESET}/N]" _MR__prompt || return 1
+    done
+    if [ "${_MR__prompt}" != "y" ] && [ "${_MR__prompt}" != "Y" ]; \
+      then exit 1; fi
+  fi
+
+
+
+  # remove all data
+  rm_svc_acc "${_MR__acc_name}" \
+    || abort "Failed to remove the existing account"
+
+  rm_acc_rc "${_MR__acc_uid}"
+
+  if command -v firewall-cmd >/dev/null \
+      && sudo firewall-cmd --get-services \
+        | grep "${_MR__firewalld_svc_name}" >/dev/null 2>/dev/null \
+      && sudo firewall-cmd --info-service="${_MR__firewalld_svc_name}" \
+              >/dev/null 2>/dev/null
+  then
+    rm_firewall_svc "${_MR__firewalld_svc_name}" \
+      || abort "Failed to remove the existing firewalld service"
+  fi
+}
+
+
+
+
+
+#==========================================================#
+#                   unit business logic                    #
+#==========================================================#
+
+
+
+# create a new linux service account
+# local prefix: NSA
+# args: <account-name> <account-home> <account-id>
+new_svc_acc() {
+  _NSA__name="${1:?name}"
+  _NSA__home="${2:?home}"
+  _NSA__id="${3:?id}"
+
+  printf " - Creating a new service account '%s' (UID/GID %s)...
+   (with home directory '%s')\n" \
+         "${_NSA__name}" \
+         "${_NSA__id}" \
+         "${_NSA__home}"
+
+  # create & init
+  sudo useradd \
+       -mU \
+       -d "${_NSA__home}" \
+       -u "${_NSA__id}" \
+       -c "${LISAM_ACC_COMMENT_PREFIX} ${_NSA__name}" \
+       -s "${SHELL:-/bin/sh}" \
+       "${_NSA__name}" || return 1
+  sudo loginctl enable-linger "${_NSA__name}" || return 1
+
+  printf "%s\n%s\n" \
+         "# for systemd command ('systemctl --user')" \
+         "export XDG_RUNTIME_DIR=\"/run/user/\$(id -u)\"" \
+    | sudo -u "${_NSA__name}" \
+           tee "${_NSA__home}/.profile.lisam" >/dev/null \
+    || return 1
+  printf "\n\n. \"\$HOME/.profile.lisam\"\n" \
+    | sudo -u "${_NSA__name}" \
+           tee -a "${_NSA__home}/.profile" \
+    | sudo -u "${_NSA__name}" \
+           tee -a "${_NSA__home}/.bashrc" >/dev/null \
+    || return 1
+  if sudo -u "${_NSA__name}" \
+          [ -e "${_NSA__home}/.bash_profile" ];
+  then
+  printf "\n\n. \"\$HOME/.profile.lisam\"\n" \
+    | sudo -u "${_NSA__name}" \
+           tee -a "${_NSA__home}/.bash_profile" \
+           >/dev/null || return 1
+  fi
+  if sudo -u "${_NSA__name}" \
+          [ -e "${_NSA__home}/.zshrc" ];
+  then
+  printf "\n\n. \"\$HOME/.profile.lisam\"\n" \
+    | sudo -u "${_NSA__name}" \
+           tee -a "${_NSA__home}/.zshrc" \
+           >/dev/null || return 1
+  fi
+}
+
+
+
+# remove an existing linux service account created by this script
+# local prefix: RSA
+# args: <account-name>
+rm_svc_acc() {
+  _RSA__name="${1:?name}"
+
+  printf " - Removing an existing service account '%s'...
+   (with its home directory)\n" \
+         "${_RSA__name}"
+
+  sudo loginctl disable-linger "${_RSA__name}" || return 1
+  sudo killall -w -u "${_RSA__name}"
+  if command -v sestatus >/dev/null
+  then sudo userdel -frZ "${_RSA__name}" || return 1
+  else sudo userdel -fr "${_RSA__name}" || return 1
+  fi
+  sudo groupdel -f "${_RSA__name}" 2>/dev/null || true
+}
+
+
+
+# create all systemd resource control configs
+# local prefix: RAR
+# args: <uid> [is-reset]
+refresh_acc_rc() {
+  _RAR__uid="${1:?uid}"
+  _RAR__reset="${2}"
+
+  # set all configurable rc configs
+  for _RAR__k in ${SYSTEMD_RC_LIST}
+  do
+    if if_var_set "${_RAR__k}"
+    then
+      _RAR__v="$(get_var_default "${_RAR__k}")" || return 1
+      _RAR__curfile="$(eval "printf \"%s\" \"\${${_RAR__k}__CURFILE}\"")"
+      _RAR__curfile_dir="${CGROUP_USER_SLICE_ROOT}/user-${_RAR__uid}.slice/"
+      if [ -n "${_RAR__v}" ] \
+           && { [ -z "${_RAR__curfile}" ] \
+                  || [ -r "${_RAR__curfile_dir}/${_RAR__curfile}" ]; }
+      then
+
+        # reset first if reset-flag is set, to prevent append on multi-value properties
+        if [ -n "${_RAR__reset}" ]
+        then
+          set_rc "${_RAR__uid}" \
+                 "$(eval "printf \"%s\" \"\${${_RAR__k}__LABEL}\"")" >/dev/null
+        fi
+
+        # set value
+        set_rc "${_RAR__uid}" \
+               "$(eval "printf \"%s\" \"\${${_RAR__k}__LABEL}\"")" \
+               "${_RAR__v}" \
+          || return 1
+      fi
+    fi
+  done
+
+  # set all accounting rc configs (nothing on stdout)
+  for _RAR__accounting in ${SYSTEMD_RC_ACCOUNTING_LIST}
+  do
+    set_rc "${_RAR__uid}" \
+           "$(eval "printf \"%s\" \"\${${_RAR__accounting}__LABEL}\"")" \
+           "true" \
+           >/dev/null \
+      || return 1
+  done
+
+  # set all non-configurable rc configs (nothing on stdout)
+  for _RAR__nonconf in ${SYSTEMD_RC_CONST_LIST}
+  do
+    _RAR__nonconf_v="$(get_var_default "${_RAR__nonconf}")" || return 1
+    set_rc "${_RAR__uid}" \
+           "$(eval "printf \"%s\" \"\${${_RAR__nonconf}__LABEL}\"")" \
+           "${_RAR__nonconf_v}" \
+           >/dev/null \
+      || return 1
+  done
+
+  # reload
+  sudo systemctl daemon-reload
+  sudo systemctl restart "${USER_SLICE_PREFIX}${_RAR__uid}${USER_SLICE_POSTFIX}"
+}
+
+
+
+# remove all systemd resource control configs
+# local prefix: RAR0
+# args: <uid>
+rm_acc_rc() {
+  _RAR0__uid="${1:?uid}"
+
+  # set all configurable rc configs
+  for _RAR0__k in ${SYSTEMD_RC_LIST}
+  do
+    set_rc "${_RAR0__uid}" \
+           "$(eval "printf \"%s\" \"\${${_RAR0__k}__LABEL}\"")" \
+      || return 1
+  done
+
+  sudo rm -rf \
+       "${SYSTEMD_USER_SLICE_PREFIX}${_RAR0__uid}${SYSTEMD_USER_SLICE_POSTFIX}" \
+       "${SYSTEMD_USER_SERVICE_PREFIX}${_RAR0__uid}${SYSTEMD_USER_SERVICE_POSTFIX}"
+
+  # reload
+  sudo systemctl daemon-reload
+  sudo systemctl restart "${USER_SLICE_PREFIX}${_RAR0__uid}${USER_SLICE_POSTFIX}"
+}
+
+
+
+# create a new firewall rule for this account
+# local prefix: NFS
+# args: <service-name>
+new_firewall_svc() {
+  # args
+  _NFS__name="${1:?name}"
+  shift 2>/dev/null
+
+  _NFS__ports="$(get_var_default USER_SOCK_ALLOW)" || return 1
+  [ -z "${_NFS__ports}" ] && return 0
+
+  printf " - Creating a new firewalld rule '%s'...
+   (with ports: %s)\n" \
+         "${_NFS__name}" "$(printf '%s' "${_NFS__ports}" | tr '\n' ' ')"
+
+  # add firewall service and apply
+  sudo firewall-cmd --permanent \
+       --new-service="${_NFS__name}" \
+       >/dev/null || return 1
+  sudo firewall-cmd --permanent \
+       --service="${_NFS__name}" \
+       --set-short="LiSAM ports config" \
+       >/dev/null || return 1
+  sudo firewall-cmd --permanent \
+       --service="${_NFS__name}" \
+       --set-description="LiSAM ports config for ${_NFS__name}" \
+       >/dev/null || return 1
+
+  for _NFS__port in ${_NFS__ports}
+  do
+    sudo firewall-cmd --permanent \
+         --service="${_NFS__name}" \
+         --add-port="${_NFS__port}"/tcp >/dev/null || return 1
+    sudo firewall-cmd --permanent \
+         --service="${_NFS__name}" \
+         --add-port="${_NFS__port}"/udp >/dev/null || return 1
+  done
+
+  # enable & reload
+  sudo firewall-cmd --permanent \
+       --add-service="${_NFS__name}" \
+       >/dev/null || return 1
+  sudo firewall-cmd --reload >/dev/null || return 1
+}
+
+
+
+# remove an existing firewall rule for this account
+# local prefix: RFS
+# args: <service-name> ...
+rm_firewall_svc() {
+  _RFS__name="${1:?name}"
+  printf " - Removing an existing firewalld rule '%s'...\n" \
+         "${_RFS__name}"
+
+  # enable & reload
+  sudo firewall-cmd --permanent \
+       --delete-service="${_RFS__name}" >/dev/null || return 1
+  sudo rm -f "/etc/firewalld/services/${_RFS__name}.xml.old" \
+       >/dev/null 2>/dev/null
+  sudo firewall-cmd --reload >/dev/null || return 1
+}
+
+
+
+
+
+#==========================================================#
+#                    application logic                     #
+#==========================================================#
+
+
+
+# check if variable is set
+# local prefix: IVS
+# args: <varname>
+if_var_set() {
+  _IVS__varname="${1:?varname}"
+  eval "[ ! -z \${${_IVS__varname}+set} ]"
+}
+
+
+
+# check if root permission, and ask password if root
+# no arg
+test_root_permission() {
+  if ! sudo true
+  then
+    abort "Root permission check failed!"
+  fi
+}
+
+
+
+# parse options
+# local prefix: PO
+# usage e.g.: parse_opts "(binname)" "(shorts)" "(longs)" "${@}" && eval set -- "${PARSE_OPTS__args}" || return 1
+# args: <bin-name> <short-opt-list> <long-opt-list> [args]...
+parse_opts() {
+  # shellcheck disable=SC2046
+  unset $(set | grep "^PARSE_OPTS__.*$" | cut -d= -f1) # unset all vars
+  _PO__bin_name="${1:?bin-name}"
+  _PO__short_list="${2?short-opt-list}"
+  _PO__long_list="${3?long-opt-list}"
+  shift 3 || return 1
+
+  # parse valid short options
+  _PO__short_list_base="$(printf "%s" "${_PO__short_list}" \
+                          | sed -n 's/\([^:]::\|[^:]:\|[^:]\)/\1\n/gp')"
+  _PO__short_list_flags="$(printf "%s" "${_PO__short_list_base}" \
+                           | sed -n 's/^\([^:]\)$/-\1/p')"
+  _PO__short_list_args="$(printf "%s" "${_PO__short_list_base}" \
+                          | sed -n 's/^\([^:]\):\?:$/-\1/p')"
+
+  # parse valid long options
+  _PO__long_list_base="$(printf "%s" "${_PO__long_list}" \
+                         | tr ',' '\n')"
+  _PO__long_list_flags="$(printf "%s" "${_PO__long_list_base}" \
+                          | sed -n 's/^\([^:][^:]*\)$/--\1/p')"
+  _PO__long_list_args="$(printf "%s" "${_PO__long_list_base}" \
+                         | sed -n 's/^\([^:][^:]*\):\?:$/--\1/p')"
+
+  _PO__evalargs="$(getopt -n "${_PO__bin_name}" -o "${_PO__short_list}" \
+                          ${_PO__long_list+--longoptions="${_PO__long_list}"} \
+                          -- "${@}")" \
+    || return 1
+  eval set -- "${_PO__evalargs:?Failed to parse arguments}" || return 1
+
+  while true
+  do
+    _PO__cur_arg="${1}"
+
+    if [ "${_PO__cur_arg}" = "--" ]
+    then
+      # export remaining as args
+      shift
+      for _PO__arg in "${@}"
+      do
+	      PARSE_OPTS__args="${PARSE_OPTS__args} $(printf "%s" "${_PO__arg}" \
+                          | sed "s/'/'\\\''/g; s/^\(.*\)$/'\1'/g;")"
+      done
+      break
+
+
+    elif printf "%s\n%s" "${_PO__short_list_flags}" "${_PO__long_list_flags}" \
+        | grep -q -- "${_PO__cur_arg}" >/dev/null 2>/dev/null
+    then
+      # flags (no additional argument: just set or not)
+      eval "PARSE_OPTS__opt$(printf '%s' "${_PO__cur_arg}" | tr '-' '_')"="\"1\"" \
+        || return 1
+      shift; continue
+
+
+    elif printf "%s\n%s" "${_PO__short_list_args}" "${_PO__long_list_args}" \
+        | grep -q -- "${_PO__cur_arg}" >/dev/null 2>/dev/null
+    then
+      # args
+      _PO__opts_name="$(eval printf "%s" \
+                                    "PARSE_OPTS__opt$(printf '%s' "${_PO__cur_arg}" | tr '-' '_')")" \
+        || return 1
+      eval "${_PO__opts_name}"="\"${2?No argument passed for the option "${_PO__cur_arg}"}
+\${${_PO__opts_name}}\"" \
+        || return 1
+      shift 2; continue
+
+
+    else
+      # unexpected token
+      printf " * Invalid token '%s'\n" "${_PO__cur_arg}" >&2
+      return 1
+
+
+    fi
+  done
+  return 0
+}
+
+
+
+# get variable value if exists,
+#   or default value (postfixed with "__DEFAULT") if empty
+# local prefix: GVD
+# args: <varname>
+get_var_default() {
+  _GVD__varname="${1:?varname}"
+  _GVD__value="$(\
+    eval "printf \"%s\" \"\${${_GVD__varname}:-\${${_GVD__varname}__DEFAULT}}\"")" \
+    || return 1
+  _GVD__default_cmd="$(\
+    eval "printf \"%s\" \"\${${_GVD__varname}__DEFAULT_CMD}\"")" \
+    || return 1
+
+  if [ -z "${_GVD__value}" ] && [ -n "${_GVD__default_cmd}" ]
+  then
+    # if value is empty and default command exists
+    eval "${_GVD__default_cmd}"
+  else
+    # print final value
+    printf "%s" "${_GVD__value}"
+  fi
+}
+
+
+
+# print label of given variable name.
+# '(given-varname)__LABEL' variable should exists.
+# local prefix: GVL
+# args: <varname>
+get_var_label() {
+  _GVL__varname="${1:?varname}"
+  eval "printf \"%s\" \"\${${_GVL__varname}__LABEL}\""
+}
+
+
+
+# print maximum number of values for given variable name.
+# '(given-varname)__CNT' variable should exists.
+# local prefix: GVL
+# args: <varname>
+get_var_cnt() {
+  _GVL__varname="${1:?varname}"
+  eval "printf \"%s\" \"\${${_GVL__varname}__CNT:-999}\""
+}
+
+
+
+# print actual value (currently applied) of given variable name.
+# '(given-varname)__CURFILE' variable should exists.
+# local prefix: GVA
+# args: <uid> <varname>
+get_var_actual() {
+  _GVA__uid="${1:?uid}"
+  _GVA__varname="${2:?varname}"
+
+  _GVA__curfile="$(eval "printf \"%s\" \"\${${_GVA__varname}__CURFILE}\"")"
+  _GVA__curfile_dir="${CGROUP_USER_SLICE_ROOT}/user-${_GVA__uid}.slice/"
+  [ -z "${_GVA__curfile}" ] && return 1
+  _GVA__value="$(\
+    [ -r "${_GVA__curfile_dir}/${_GVA__curfile}" ] \
+      && cat "${_GVA__curfile_dir}/${_GVA__curfile}" 2>/dev/null)"
+
+  if [ "${_GVA__value}" -gt 1048576 ] 2>/dev/null \
+       && command -v numfmt >/dev/null 2>/dev/null
+  then
+    # try print long number more than 1M as iec-i format, fallback if error
+    printf "%s" "${_GVA__value}" | numfmt --to=iec-i 2>/dev/null \
+      || printf "%s" "${_GVA__value}"
+  else
+    printf "%s" "${_GVA__value}"
+  fi
+}
+
+
+
+# search usable uid
+# local prefix: SEUI
+# args: [id-min-inc] [id-max-exc]
+search_empty_user_id() {
+  _SEUI__id_min="${1:-${UID_LOWER_LIMIT_INC}}"
+  _SEUI__id_max="${1:-${UID_UPPER_LIMIT_EXC}}"
+  
+  if ! [ "${_SEUI__id_min}" -lt "${_SEUI__id_max}" ]
+  then
+    abort "Invalid UID range variables"
+  fi
+  _SEUI__cur_id="${_SEUI__id_min}"
+
+  while \
+    getent passwd "${_SEUI__cur_id}" \
+           >/dev/null 2>/dev/null \
+      || getent group "${_SEUI__cur_id}" \
+                >/dev/null 2>/dev/null
+  do
+    _SEUI__cur_id="
+$(( _SEUI__cur_id + 1 ))"
+    if ! [ "${_SEUI__cur_id}" \
+             -lt "${_SEUI__id_max}" ]
+    then
+      if [ "$((_SEUI__id_min + 1))" -eq "${_SEUI__id_max}" ]
+      then abort "Invalid UID/GID '${_SEUI__id_min}'"
+      else abort "No usable UID/GID found in the given range '[${_SEUI__id_min}, ${_SEUI__id_max})'"
+      fi
+    fi
+    true
+  done
+
+  printf "%s" "$(( _SEUI__cur_id ))"
+}
+
+
+
+# get systemd cgroup slice data
+# local prefix: CR
+# args: <uid>
+cache_rc() {
+  _CR__uid="${1:?UID}"
+
+  _CR__slice_name="${USER_SLICE_PREFIX}${_CR__uid}${USER_SLICE_POSTFIX}"
+
+  USER_SLICE_RC_CONTENT="$(export LC_COLLATE=C; \
+                           grep -ho "^[^#]*=[^#]*$" \
+                           $(systemctl show "${_CR__slice_name}" -p DropInPaths --value))"
+}
+
+
+
+# get systemd cgroup slice data
+# local prefix: GR
+# args: <uid> <key> [max-count]
+get_rc() {
+  _GR__uid="${1:?UID}"
+  _GR__k="${2:?key}"
+  _GR__max_cnt="${3:-999}"
+
+  [ -z "${USER_SLICE_RC_CONTENT}" ] && cache_rc "${_GR__uid}"
+
+  printf "%s\n" "${USER_SLICE_RC_CONTENT}" | grep "^${_GR__k}=" \
+    | tail -n"${_GR__max_cnt}" | cut -d= -f2-
+}
+
+
+
+# set systemd cgroup slice. removed if val is null
+# local prefix: SR
+# args: <uid> <key> [val]
+set_rc() {
+  _SR__uid="${1:?UID}"
+  _SR__k="${2:?key}"
+  _SR__v="${3}"
+
+  if [ -n "${_SR__v}" ]
+  then
+    (
+      IFS='
+'
+      for _SR__v_cur in ${_SR__v}
+      do
+        # set
+        printf " - Setting systemd user slice param [%s] to [%s] ...\n" \
+               "${_SR__k}" "${_SR__v_cur}"
+        sudo systemctl set-property \
+             "${USER_SLICE_PREFIX}${_SR__uid}${USER_SLICE_POSTFIX}" \
+             "${_SR__k}=${_SR__v_cur}" || exit 1
+      done
+    )
+  else
+    # remove
+    printf " - Resetting systemd user slice param [%s] ...\n" \
+           "${_SR__k}"
+    sudo systemctl set-property \
+         "${USER_SLICE_PREFIX}${_SR__uid}${USER_SLICE_POSTFIX}" \
+         "${_SR__k}="
+  fi
+}
+
+
+
+# check if output should be treated as terminal output
+terminal_output() {
+  [ -t 1 ] || [ -n "${LISAM_COLORED}" ]
+}
+
+
+
+
+
+#==========================================================#
+#                         message                          #
+#==========================================================#
+
+
+
+# print usage string
+# no arg
+print_usage() {
+
+  printf "usage: %s%s <MODE> [ARGS]... [<OPT> <OPT_VAL>]...%s
+
+ $ %s%s %sadd%s <account-name>%s \\
+             [<%s> %s<OPT_VAL>%s] \\
+             [<%s|
+               %s|
+               %s|
+               %s|
+               %s> %s<OPT_VAL>%s]
+ $ %s%s %smod%s <account-name>%s \\
+             [<%s> %s<OPT_VAL>%s] \\
+             [<%s|
+               %s|
+               %s|
+               %s|
+               %s> %s<OPT_VAL>%s]
+ $ %s%s %sls%s%s
+ $ %s%s %sdetail%s <account-name>%s
+ $ %s%s %srm%s <account-name>%s [%s]
+ $ %s%s %susage%s%s
+ $ %s%s %shelp%s%s
+ 
+" \
+         "${C_G_FG}" "${BIN_BASENAME}" "${C_RESET}" \
+         "${C_Y_FG}" "${BIN_BASENAME}" "${C_G_FG}" "${C_Y_FG}" "${C_RESET}" \
+         "$(print_usage_opts short u c C m M s z t i d p)" "${C_C_FG}" "${C_RESET}" \
+         "$(print_usage_opts long uid cpu-weight cpu-quota)" \
+         "$(print_usage_opts long memory-max memory-high)" \
+         "$(print_usage_opts long swap-max zswap-max)" \
+         "$(print_usage_opts long tasks-max io-weight)" \
+         "$(print_usage_opts long dev-allowed sock-allowed)" \
+         "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${BIN_BASENAME}" "${C_G_FG}" "${C_Y_FG}" "${C_RESET}" \
+         "$(print_usage_opts short c C m M s z t i d p)" "${C_C_FG}" "${C_RESET}" \
+         "$(print_usage_opts long cpu-weight cpu-quota)" \
+         "$(print_usage_opts long memory-max memory-high)" \
+         "$(print_usage_opts long swap-max zswap-max)" \
+         "$(print_usage_opts long tasks-max io-weight)" \
+         "$(print_usage_opts long dev-allowed sock-allowed)" \
+         "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${BIN_BASENAME}" "${C_G_FG}" "${C_Y_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${BIN_BASENAME}" "${C_G_FG}" "${C_Y_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${BIN_BASENAME}" "${C_G_FG}" "${C_Y_FG}" "${C_RESET}" \
+         "$(print_usage_opts mixed -f --force)" \
+         "${C_Y_FG}" "${BIN_BASENAME}" "${C_G_FG}" "${C_Y_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${BIN_BASENAME}" "${C_G_FG}" "${C_Y_FG}" "${C_RESET}"
+}
+
+
+
+# combine opt list to pretty formatted
+# local prefix: PUO
+# args: <fmt:short/long/mixed> <options>...
+print_usage_opts() {
+  _PUO__fmt="${1:?format}"
+  shift 2>/dev/null
+  _PUO__txt=""
+
+  unset _PUO__prefix
+  case "${_PUO__fmt}" in
+    short) _PUO__prefix="-" ;;
+    long) _PUO__prefix="--" ;;
+    mixed) _PUO__prefix="" ;;
+    *) return 1 ;;
+  esac
+
+  for _PUO__opt in "${@}"
+  do
+    [ -n "${_PUO__opt}" ] \
+      && _PUO__txt="${_PUO__txt}${C_Y_FG}${_PUO__prefix}${_PUO__opt}${C_RESET}|"
+  done
+
+  _PUO__txt="${_PUO__txt%|}"
+
+  printf "%s" "${_PUO__txt}"
+}
+
+
+
+# print help string
+# no arg
+print_help() {
+
+  printf "usage: %s%s <MODE> [ARGS]... [<OPT> <OPT_VAL>]...%s
+
+
+%s<MODE>%s
+
+   - %sadd%s: create a new LiSAM service account
+       $ %s%s add <account-name> [OPTIONS]...%s
+         [OPTIONS]
+           %s-u%s, %s--uid%s %s< # >%s                             : Linux account UID
+           %s-c%s, %s--cpu-weight%s %s< 1-10000 | idle >%s         : Systemd CPUWeight
+           %s-C%s, %s--cpu-quota%s %s< #%% >%s                      : Systemd CPUQuota
+           %s-m%s, %s--memory-max%s %s< #[K|M|G|T] | 0%%-100%% >%s   : Systemd MemoryMax
+           %s-M%s, %s--memory-high%s %s< #[K|M|G|T] | 0%%-100%% >%s  : Systemd MemoryHigh
+           %s-s%s, %s--swap-max%s %s< #[K|M|G|T] | 0%%-100%% >%s     : Systemd MemorySwapMax
+           %s-z%s, %s--zswap-max%s %s< #[K|M|G|T] | 0%%-100%% >%s    : Systemd MemoryZSwapMax
+           %s-t%s, %s--tasks-max%s %s< # >%s                       : Systemd TasksMax
+           %s-i%s, %s--io-weight%s %s< 1-10000 >%s                 : Systemd IOWeight
+           %s-d%s, %s--dev-allowed%s %s< \${DEV_PATH} >%s           : Systemd DeviceAllow
+               * Pass multiple options to set more than one device path
+           %s-p%s, %s--sock-allowed%s %s< 1-65535 >%s              : Systemd SockBindAllow
+               * Pass multiple options to set more than one
+
+   - %smod%s: modify a LiSAM service account
+       $ %s%s mod <account-name> [OPTIONS]...%s
+         [OPTIONS]
+           %s-c%s, %s--cpu-weight%s %s< 1-10000 | idle >%s         : Systemd CPUWeight
+           %s-C%s, %s--cpu-quota%s %s< #%% >%s                      : Systemd CPUQuota
+           %s-m%s, %s--memory-max%s %s< #[K|M|G|T] | 0%%-100%% >%s   : Systemd MemoryMax
+           %s-M%s, %s--memory-high%s %s< #[K|M|G|T] | 0%%-100%% >%s  : Systemd MemoryHigh
+           %s-s%s, %s--swap-max%s %s< #[K|M|G|T] | 0%%-100%% >%s     : Systemd MemorySwapMax
+           %s-z%s, %s--zswap-max%s %s< #[K|M|G|T] | 0%%-100%% >%s    : Systemd MemoryZSwapMax
+           %s-t%s, %s--tasks-max%s %s< # >%s                       : Systemd TasksMax
+           %s-i%s, %s--io-weight%s %s< 1-10000 >%s                 : Systemd IOWeight
+           %s-d%s, %s--dev-allowed%s %s< \${DEV_PATH} >%s           : Systemd DeviceAllow
+               * Pass multiple options to set more than one device path
+           %s-p%s, %s--sock-allowed%s %s< 1-65535 >%s              : Systemd SockBindAllow
+               * Pass multiple options to set more than one
+
+   - %sls%s: list all LiSAM service accounts
+       $ %s%s ls%s
+
+   - %sdetail%s: print details of an LiSAM service account
+       $ %s%s detail <account-name>%s
+
+   - %srm%s: remove an LiSAM service account
+       $ %s%s rm <account-name> [OPTIONS]...%s
+         [OPTIONS]
+           %s-f%s, %s--force%s                 : Force remove without prompt
+
+   - %susage%s: print usage message
+       $ %s%s usage%s
+
+   - %shelp%s: print help message
+       $ %s%s help%s
+
+
+%s[OPT_VAL] Special Patterns%s
+
+   - %s<%sX%s>%s     : Required wrapper
+   - %s[%sX%s]%s     : Optional wrapper (X can be omitted)
+   - %s#%s       : Arbitrary digits (positive integer)
+   - %s\${%sX%s}%s    : Arbitrary string (X is a description of the string)
+   - %sA%s|%sB%s     : A or B
+   - %sA%s-%sB%s     : Value range from A to B (inclusive)
+ 
+" \
+         "${C_G_FG}" "${BIN_BASENAME}" "${C_RESET}" \
+         "${C_M_FG}" "${C_RESET}" \
+         "${C_G_FG}" "${C_RESET}" "${C_Y_FG}" "${BIN_BASENAME}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_G_FG}" "${C_RESET}" "${C_Y_FG}" "${BIN_BASENAME}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" "${C_C_FG}" "${C_RESET}" \
+         "${C_G_FG}" "${C_RESET}" "${C_Y_FG}" "${BIN_BASENAME}" "${C_RESET}" \
+         "${C_G_FG}" "${C_RESET}" "${C_Y_FG}" "${BIN_BASENAME}" "${C_RESET}" \
+         "${C_G_FG}" "${C_RESET}" "${C_Y_FG}" "${BIN_BASENAME}" "${C_RESET}" \
+         "${C_Y_FG}" "${C_RESET}" "${C_Y_FG}" "${C_RESET}" \
+         "${C_G_FG}" "${C_RESET}" "${C_Y_FG}" "${BIN_BASENAME}" "${C_RESET}" \
+         "${C_G_FG}" "${C_RESET}" "${C_Y_FG}" "${BIN_BASENAME}" "${C_RESET}" \
+         "${C_M_FG}" "${C_RESET}" \
+         "${C_G_FG}" "${C_B_FG}" "${C_G_FG}" "${C_RESET}" \
+         "${C_G_FG}" "${C_B_FG}" "${C_G_FG}" "${C_RESET}" \
+         "${C_B_FG}" "${C_RESET}" \
+         "${C_G_FG}" "${C_B_FG}" "${C_G_FG}" "${C_RESET}" \
+         "${C_B_FG}" "${C_G_FG}" "${C_B_FG}" "${C_RESET}" \
+         "${C_B_FG}" "${C_G_FG}" "${C_B_FG}" "${C_RESET}"
+}
+
+
+
+# print error message
+# local prefix: PE
+# args: <error-msg>
+print_err() {
+  _PE__msg="${1:?msg}"
+
+  printf "%s: %s%s%s\n" \
+         "${BIN_BASENAME}" \
+         "${C_ERR_FG}" "${_PE__msg}" "${C_RESET}" \
+         >&2
+}
+
+
+
+# print error message then exit
+# local prefix: A
+# args: <error-msg> [exit-code]
+abort() {
+  _A__msg="${1:?msg}"
+  _A__exitcode="${2}"
+
+  print_err "${_A__msg}"
+  exit "${_A__exitcode:-1}"
+}
+
+
+
+# print error message with help string then exit
+# local prefix: AH
+# args: <error-msg> [exit-code]
+abort_usage() {
+  _AH__msg="${1:?msg}"
+  _AH__exitcode="${2}"
+
+
+  abort "${_AH__msg}
+
+${C_RESET}$(print_usage)" "${_AH__exitcode}"
+}
+
+
+
+# read string from user
+# local prefix: RN
+# args: <message> <var-name>
+read_normal() {
+  _RN__msg="${1:?msg}"
+  _RN__name="${2:?name}"
+
+  trap 'printf "${C_RESET} \n"; return 1' TERM HUP INT
+  printf " + %s:%s " "${_RN__msg}" "${C_RESET}${C_ERR_FG}"
+  read -r "${_RN__name?}"
+  _RN__ret_val="${?}"
+  trap - TERM HUP INT
+  printf "%s\n" "${C_RESET}"
+
+  return "${_RN__ret_val}"
+}
+
+
+
+# set colors
+# no arg
+set_colors() {
+  unset C_G_FG C_G_BG C_ERR_FG C_ERR_BG C_RESET
+  if terminal_output
+  then
+    # shellcheck disable=SC2034
+    C_ERR_FG="$(tput setaf 1 2>/dev/null)"
+    # shellcheck disable=SC2034
+    C_ERR_BG="$(tput setaf 0 2>/dev/null)$(tput setab 1 2>/dev/null)"
+    # shellcheck disable=SC2034
+    C_G_FG="$(tput setaf 2 2>/dev/null)"
+    # shellcheck disable=SC2034
+    C_G_BG="$(tput setaf 0 2>/dev/null)$(tput setab 2 2>/dev/null)"
+    # shellcheck disable=SC2034
+    C_Y_FG="$(tput setaf 3 2>/dev/null)"
+    # shellcheck disable=SC2034
+    C_Y_BG="$(tput setaf 0 2>/dev/null)$(tput setab 3 2>/dev/null)"
+    # shellcheck disable=SC2034
+    C_B_FG="$(tput setaf 4 2>/dev/null)"
+    # shellcheck disable=SC2034
+    C_B_BG="$(tput setaf 0 2>/dev/null)$(tput setab 4 2>/dev/null)"
+    # shellcheck disable=SC2034
+    C_M_FG="$(tput setaf 5 2>/dev/null)"
+    # shellcheck disable=SC2034
+    C_M_BG="$(tput setaf 0 2>/dev/null)$(tput setab 5 2>/dev/null)"
+    # shellcheck disable=SC2034
+    C_C_FG="$(tput setaf 6 2>/dev/null)"
+    # shellcheck disable=SC2034
+    C_C_BG="$(tput setaf 0 2>/dev/null)$(tput setab 6 2>/dev/null)"
+    # shellcheck disable=SC2034
+    C_RESET="$(tput sgr0 2>/dev/null)$(tput el 2>/dev/null)"
+  fi
+}
+
+
+
+
+
+####################
+main "${@}"

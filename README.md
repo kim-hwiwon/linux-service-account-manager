@@ -1,4 +1,4 @@
-# Linux Service Account Manager (LSAM)
+# Linux Service Account Manager (LiSAM)
 
 
 ## Description
@@ -6,28 +6,82 @@
 Make a new linux user account which can be used as general purpose service account.  
 (Mainly targeted for `RHEL`-derivatives, may also work on `Debian`-derivatives)  
   
-Users created by this script will have:
-- User systemd functions (with `loginctl enable-linger` and `export XDG_RUNTIME_DIR`)
-- Ports opened for the account (in `firewalld`)
-  - If `firewalld` is not installed on the system, [port] parameters are ignored.
+Users created by this script will:
+- Have user systemd service functions (with `loginctl enable-linger` and `export XDG_RUNTIME_DIR`)
+- Have limited systemd resources, configured by systemd resource control (cgroups)
+- (Optional) Get open ports for the account (with `firewalld`)
+  - Ignored if `firewalld` is not installed on the system
 
 
 ## Usage
 
 ```
-usage: lsam <MODE> [args...]
 
-  <MODE>
-   - add:     create a new LSAM service account
-                 $ lsam add <account-name> [port-1] [port-2] ...
-   - ls:      list all LSAM service accounts
-                 $ lsam ls
-   - detail:  print details of an LSAM service account
-                 $ lsam detail <account-name>
-   - rm:      remove an LSAM service account
-                 $ lsam rm <account-name> [force]
-   - help:    print help message
-                 $ lsam help
+usage: lisam <MODE> [ARGS]... [<OPT> <OPT_VAL>]...
+
+
+<MODE>
+
+   - add: create a new LiSAM service account
+       $ lisam add <account-name> [OPTIONS]...
+         [OPTIONS]
+           -u, --uid < # >                             : Linux account UID
+           -c, --cpu-weight < 1-10000 | idle >         : Systemd CPUWeight
+           -C, --cpu-quota < #% >                      : Systemd CPUQuota
+           -m, --memory-max < #[K|M|G|T] | 0%-100% >   : Systemd MemoryMax
+           -M, --memory-high < #[K|M|G|T] | 0%-100% >  : Systemd MemoryHigh
+           -s, --swap-max < #[K|M|G|T] | 0%-100% >     : Systemd MemorySwapMax
+           -z, --zswap-max < #[K|M|G|T] | 0%-100% >    : Systemd MemoryZSwapMax
+           -t, --tasks-max < # >                       : Systemd TasksMax
+           -i, --io-weight < 1-10000 >                 : Systemd IOWeight
+           -d, --dev-allowed < ${DEV_PATH} >           : Systemd DeviceAllow
+               * Pass multiple options to set more than one device path
+           -p, --sock-allowed < 1-65535 >              : Systemd SockBindAllow
+               * Pass multiple options to set more than one
+
+   - mod: modify a LiSAM service account
+       $ lisam mod <account-name> [OPTIONS]...
+         [OPTIONS]
+           -c, --cpu-weight < 1-10000 | idle >         : Systemd CPUWeight
+           -C, --cpu-quota < #% >                      : Systemd CPUQuota
+           -m, --memory-max < #[K|M|G|T] | 0%-100% >   : Systemd MemoryMax
+           -M, --memory-high < #[K|M|G|T] | 0%-100% >  : Systemd MemoryHigh
+           -s, --swap-max < #[K|M|G|T] | 0%-100% >     : Systemd MemorySwapMax
+           -z, --zswap-max < #[K|M|G|T] | 0%-100% >    : Systemd MemoryZSwapMax
+           -t, --tasks-max < # >                       : Systemd TasksMax
+           -i, --io-weight < 1-10000 >                 : Systemd IOWeight
+           -d, --dev-allowed < ${DEV_PATH} >           : Systemd DeviceAllow
+               * Pass multiple options to set more than one device path
+           -p, --sock-allowed < 1-65535 >              : Systemd SockBindAllow
+               * Pass multiple options to set more than one
+
+   - ls: list all LiSAM service accounts
+       $ lisam ls
+
+   - detail: print details of an LiSAM service account
+       $ lisam detail <account-name>
+
+   - rm: remove an LiSAM service account
+       $ lisam rm <account-name> [OPTIONS]...
+         [OPTIONS]
+           -f, --force                 : Force remove without prompt
+
+   - usage: print usage message
+       $ lisam usage
+
+   - help: print help message
+       $ lisam help
+
+
+[OPT_VAL] Special Patterns
+
+   - <X>     : Required wrapper
+   - [X]     : Optional wrapper (X can be omitted)
+   - #       : Arbitrary digits (positive integer)
+   - ${X}    : Arbitrary string (X is a description of the string)
+   - A|B     : A or B
+   - A-B     : Value range from A to B (inclusive)
+
 ```
 
 
@@ -35,20 +89,6 @@ usage: lsam <MODE> [args...]
 Check below to utilize the script conveniently (Optional).
 
 - To print manual for this command on ssh login:  
-  1. Place `lsam` script to `$PATH` (or just place the script in the directory `~/bin` if your shell supports it by default),  
-  2. Then add below to the file `~/.ssh/rc`:
-     ```shell
-     printf "\n
-     ================[ LSAM service account list ]===============
-     %s
-     ============================================================
-     
-     
-     =======================[ LSAM usage ]=======================
-     * Create or manage service accounts with the command 'lsam'.
-     - %s
-     ============================================================
-     
-     \n" "$(lsam ls | tr '\n' '\t')" "$(lsam help)"
-     ```
+  1. Place `lisam` script to `$PATH` (or just place the script in the directory `~/bin` if your shell supports it by default),  
+  2. Then copy the [ssh welcome message script](asset/ssh.rc) to the path `~/.ssh/rc`, or write down your own welcome message script there.  
      ![ssh login help message](readme-asset/ssh-login-help-msg.png)
