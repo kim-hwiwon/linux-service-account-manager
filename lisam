@@ -106,7 +106,7 @@ LIST_SPACES="${LIST_SPACES:-3}"
 
 # fixed
 BIN_BASENAME="$(basename "${0}")"
-ACC_HOME_BASEDIR="/opt/lisam"
+ACC_HOME_BASEDIR="/home"
 LISAM_FILE_PREFIX="LiSAM"     # no dash ('-')
 LISAM_ACC_COMMENT_PREFIX="[LiSAM]" # no space (' ')
 USER_SLICE_PREFIX="user-"
@@ -245,7 +245,7 @@ USER_ZSWAP_MAX__CURFILE="memory.zswap.max"
 # shellcheck disable=SC2034
 USER_TASKS_MAX__CURFILE="pids.max"
 # shellcheck disable=SC2034
-USER_IO_WEIGHT__CURFILE="io.weight"
+USER_IO_WEIGHT__CURFILE="io.weight io.bfq.weight"
 
 # default values
 # shellcheck disable=SC2034
@@ -369,7 +369,7 @@ mode_add() {
   if getent group "${_MA__acc_name}" >/dev/null 2>/dev/null; \
     then abort "Linux user group '${_MA__acc_name}' already exists"; fi
 
-  _MA__acc_home="${ACC_HOME_BASEDIR}/${_MA__acc_name}"
+  _MA__acc_home="${ACC_HOME_BASEDIR}/.${LISAM_FILE_PREFIX}.${_MA__acc_name}"
   if [ -e "${_MA__acc_home}" ]; \
     then abort "Home directory '${_MA__acc_home}' already exists"; fi
 
@@ -799,11 +799,7 @@ refresh_acc_rc() {
     if if_var_set "${_RAR__k}"
     then
       _RAR__v="$(get_var_default "${_RAR__k}")" || return 1
-      _RAR__curfile="$(eval "printf \"%s\" \"\${${_RAR__k}__CURFILE}\"")"
-      _RAR__curfile_dir="${CGROUP_USER_SLICE_ROOT}/user-${_RAR__uid}.slice/"
-      if [ -n "${_RAR__v}" ] \
-           && { [ -z "${_RAR__curfile}" ] \
-                  || [ -r "${_RAR__curfile_dir}/${_RAR__curfile}" ]; }
+      if [ -n "${_RAR__v}" ]
       then
 
         # reset first if reset-flag is set, to prevent append on multi-value properties
@@ -857,13 +853,13 @@ rm_acc_rc() {
   _RAR0__uid="${1:?uid}"
 
   # set all configurable rc configs
+  _RAR0__return=0
   for _RAR0__k in ${SYSTEMD_RC_LIST}
   do
     set_rc "${_RAR0__uid}" \
-           "$(eval "printf \"%s\" \"\${${_RAR0__k}__LABEL}\"")" \
-      || return 1
+           "$(eval "printf \"%s\" \"\${${_RAR0__k}__LABEL}\"")" 2>/dev/null \
+      || _RAR0__return=1
   done
-
   sudo rm -rf \
        "${SYSTEMD_USER_SLICE_PREFIX}${_RAR0__uid}${SYSTEMD_USER_SLICE_POSTFIX}" \
        "${SYSTEMD_USER_SERVICE_PREFIX}${_RAR0__uid}${SYSTEMD_USER_SERVICE_POSTFIX}"
@@ -871,6 +867,8 @@ rm_acc_rc() {
   # reload
   sudo systemctl daemon-reload
   sudo systemctl restart "${USER_SLICE_PREFIX}${_RAR0__uid}${USER_SLICE_POSTFIX}"
+
+  return "${_RAR0__return}"
 }
 
 
@@ -1113,8 +1111,12 @@ get_var_actual() {
   _GVA__curfile_dir="${CGROUP_USER_SLICE_ROOT}/user-${_GVA__uid}.slice/"
   [ -z "${_GVA__curfile}" ] && return 1
   _GVA__value="$(\
-    [ -r "${_GVA__curfile_dir}/${_GVA__curfile}" ] \
-      && cat "${_GVA__curfile_dir}/${_GVA__curfile}" 2>/dev/null)"
+    for _GVA__curfile_cur in ${_GVA__curfile}
+    do
+      [ -r "${_GVA__curfile_dir}/${_GVA__curfile_cur}" ] \
+        && cat "${_GVA__curfile_dir}/${_GVA__curfile_cur}" 2>/dev/null \
+        && break;
+    done)"
 
   if [ "${_GVA__value}" -gt 1048576 ] 2>/dev/null \
        && command -v numfmt >/dev/null 2>/dev/null
@@ -1220,6 +1222,20 @@ set_rc() {
              "${_SR__k}=${_SR__v_cur}" || exit 1
       done
     )
+
+    ######## temp code to resolve a bug:
+    ########   when setting SocketBindAllow with set-property,
+    ########   actual file contents are assigned with ': ', not '=', which causing error not to be assigned.
+    _SR__tmp="$(mktemp)"
+    for _SR__conf in "${SYSTEMD_USER_SLICE_PREFIX}${_SR__uid}${SYSTEMD_USER_SLICE_POSTFIX}"/*"${_SR__k}"*.conf
+    do
+      [ -r "${_SR__conf}" ] \
+        && sed -e 's/^\([^#=: ]\{1,\}\): /\1=/g' "${_SR__conf}" 2>/dev/null | tee "${_SR__tmp}" >/dev/null \
+        && cat "${_SR__tmp}" | sudo tee "${_SR__conf}" >/dev/null
+    done
+    rm -f "${_SR__tmp}"
+    ########
+
   else
     # remove
     printf " - Resetting systemd user slice param [%s] ...\n" \
