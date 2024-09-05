@@ -7,7 +7,7 @@
 #                                                          #
 #==========================================================#
 
-command -v lisam >/dev/null && printf "\n
+[ -n "${SSH_TTY}" ] && command -v lisam >/dev/null && printf "\n
 ===============[ LiSAM service account list ]===============
 %s
 ============================================================
